@@ -32,11 +32,10 @@ test("直接新建场景，完成萃取、建议、五类资产、发布与归�
   await login(page);
 
   await page.getByRole("button", { name: "新建场景" }).click();
+  await expect(page.getByText("Step 01 · 场景与素材", { exact: true })).toBeVisible();
   await page.getByLabel(/场景名称/).fill(sceneName);
   await page.getByLabel("场景描述").fill("从制度、流程和案例中沉淀差旅审核知识");
   await page.getByLabel("萃取目标").fill("生成规则、流程、QA、Skill 与评测集");
-  await page.getByRole("button", { name: "创建并进入" }).click();
-  await expect(page.getByText(sceneName, { exact: true })).toBeVisible();
 
   const materialText = [
     "当员工提交差旅申请时，必须填写出差目的、预算和成本中心；预算超过一万元时由部门负责人复核。",
@@ -49,13 +48,23 @@ test("直接新建场景，完成萃取、建议、五类资产、发布与归�
     buffer: Buffer.from(materialText),
   });
   await expect(page.getByText("travel-policy.txt", { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "进入知识萃取" }).click();
+  await page.getByRole("button", { name: "保存并进入知识萃取" }).click();
+  await expect(page.getByText(sceneName, { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "启动知识萃取" }).click();
   await expect(page.getByRole("heading", { name: "知识研判文档" })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByLabel("知识研判 Markdown")).toContainText("规则清单");
 
-  await page.getByRole("button", { name: "生成 AI 建议" }).click();
-  await expect(page.getByRole("heading", { name: "建议补充审计闭环" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "一致性检查" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "监管对齐" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "查漏补缺" })).toBeVisible();
+  await page.getByRole("button", { name: "一致性检查" }).click();
+  await expect(page.getByRole("heading", { name: "请确认本次修改" })).toBeVisible();
+  await page.getByRole("button", { name: "放弃" }).click();
+  await expect(page.getByText("已放弃该建议，正文没有变化。", { exact: true })).toBeVisible();
+
+  await page.getByLabel("AI 修改指令").fill("为执行动作补充复核留痕与异常升级条件");
+  await page.getByRole("button", { name: "发送修改指令" }).click();
+  await expect(page.getByRole("heading", { name: "请确认本次修改" })).toBeVisible();
   await page.getByRole("button", { name: "采纳建议" }).click();
   await expect(page.getByRole("status")).toContainText("已采纳建议并生成新修订。");
   await expect(page.getByLabel("知识研判 Markdown")).toContainText("复核要求");
@@ -70,18 +79,23 @@ test("直接新建场景，完成萃取、建议、五类资产、发布与归�
 
   await page.getByTitle("模型接入").click();
   await page.getByRole("button", { name: "新增模型" }).click();
-  await page.getByLabel(/连接名称/).fill(`浏览器密钥边界-${testInfo.project.name}`);
-  await page.getByLabel(/模型名称/).fill("deepseek-test-model");
+  const modelConnectionName = `浏览器密钥边界-${testInfo.project.name}`;
+  await page.getByLabel(/连接名称/).fill(modelConnectionName);
+  await page.getByLabel(/Provider/).selectOption("OpenAI");
+  await page.getByLabel(/模型名称/).fill("openai-compatible-test-model");
   await page.getByLabel(/API 地址/).fill("https://example.invalid/v1");
   await page.getByLabel(/API Key/).fill("e2e-secret-must-never-return");
   await page.getByRole("button", { name: "保存连接" }).click();
-  await expect(page.getByText("••••••••••••", { exact: true })).toBeVisible();
+  const savedModelRow = page.locator("article.model-row").filter({ hasText: modelConnectionName });
+  await expect(savedModelRow.getByText("••••••••••••", { exact: true })).toBeVisible();
   await expect(page.locator("body")).not.toContainText("e2e-secret-must-never-return");
-  await page.getByLabel(new RegExp(`编辑浏览器密钥边界-${testInfo.project.name}`)).click();
+  await page.getByLabel(`编辑${modelConnectionName}`).click();
   await expect(page.getByLabel(/API Key/)).toHaveValue("");
   await page.getByLabel("关闭").click();
 
   await page.getByTitle("智能体与 Skill").click();
+  await expect(page.getByLabel("批量应用模型")).toBeVisible();
+  await expect(page.getByLabel("批量应用模型")).toContainText(`${modelConnectionName} · OpenAI`);
   await page.getByRole("button", { name: /Skill 库/ }).click();
   await page.locator('input[type="file"][accept=".zip"]').setInputFiles({
     name: "unsafe.zip",
@@ -121,7 +135,7 @@ test("场景探索公平分析素材并带入新场景", async ({ page }, testIn
   await page.getByRole("button", { name: "带入新场景" }).first().click();
   await expect(page.getByText("Step 01 · 场景与素材", { exact: true })).toBeVisible();
   await expect(page.getByText(`refund-${testInfo.project.name}.txt`, { exact: true })).toBeVisible();
-  await page.getByRole("button", { name: "进入知识萃取" }).click();
+  await page.getByRole("button", { name: "保存并进入知识萃取" }).click();
   await page.getByRole("button", { name: "启动知识萃取" }).click();
   await expect(page.getByRole("heading", { name: "知识研判文档" })).toBeVisible({ timeout: 20_000 });
   await page.screenshot({ path: testInfo.outputPath("exploration-to-document.png"), fullPage: true });

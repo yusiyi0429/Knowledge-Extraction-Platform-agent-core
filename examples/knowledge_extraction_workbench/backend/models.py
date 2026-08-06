@@ -195,3 +195,18 @@ class AbilityMount(SQLModel, table=True):
     skill_version_id: Optional[str] = Field(default=None, foreign_key="skillversion.id")
     params_json: str = Field(default="{}", sa_column=Column(Text))
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class AbilityProfile(SQLModel, table=True):
+    """Scene-scoped overrides for an ability mount; GLOBAL remains on AbilityMount."""
+
+    __table_args__ = (UniqueConstraint("mount_id", "scope_key", name="uq_ability_profile_scope"),)
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    mount_id: str = Field(foreign_key="abilitymount.id", index=True)
+    scope_key: str = Field(index=True, max_length=240)
+    enabled: bool = Field(default=True)
+    model_connection_id: Optional[str] = Field(default=None, foreign_key="modelconnection.id")
+    skill_version_id: Optional[str] = Field(default=None, foreign_key="skillversion.id")
+    params_json: str = Field(default="{}", sa_column=Column(Text))
+    updated_at: datetime = Field(default_factory=utc_now)

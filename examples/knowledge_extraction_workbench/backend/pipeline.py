@@ -1,4 +1,4 @@
-"""Parsing, fair chunk selection, deterministic Fake Model, and asset generation."""
+"""Parsing, fair chunk selection, test doubles, and asset generation."""
 
 from __future__ import annotations
 
@@ -59,6 +59,15 @@ def _information_score(text: str) -> float:
     return min(len(compact), 1200) / 1200 + unique_ratio + min(punctuation, 20) / 20 + informative / len(compact)
 
 
+def normalize_chunk_text(text: str) -> str:
+    """Use one canonical representation for selection, hashing, and execution."""
+    return text.strip()
+
+
+def chunk_text_sha256(text: str) -> str:
+    return hashlib.sha256(normalize_chunk_text(text).encode()).hexdigest()
+
+
 def _coverage_best(chunks: list[tuple[int, str]], count: int) -> list[tuple[int, str, float]]:
     """Pick the highest-information chunk from evenly spaced full-document buckets."""
     if count <= 0 or not chunks:
@@ -83,7 +92,11 @@ def fair_select_chunks(
     """Allocate slots round-robin, then cover each selected material from start to end."""
     usable: list[tuple[str, str, list[tuple[int, str]]]] = []
     for material_id, material_name, chunks in materials:
-        filtered = [(index, text.strip()) for index, text in enumerate(chunks) if len(text.strip()) >= min_chars]
+        filtered = []
+        for index, text in enumerate(chunks):
+            normalized = normalize_chunk_text(text)
+            if len(normalized) >= min_chars:
+                filtered.append((index, normalized))
         if filtered:
             usable.append((material_id, material_name, filtered))
     if not usable:
@@ -173,10 +186,10 @@ def _short_title(text: str, fallback: str) -> str:
     return (cleaned[:22] or fallback).rstrip("的与和")
 
 
-class FakeKnowledgeModel:
-    """Deterministic local model used for tests and the default demo workflow."""
+class DeterministicTestModel:
+    """Deterministic model injected explicitly by automated tests only."""
 
-    model_id = "fake-knowledge-extractor-v1"
+    model_id = "deterministic-test-model"
 
     async def explore(self, chunks: list[ChunkRef]) -> list[dict[str, Any]]:
         sentences: list[tuple[str, ChunkRef]] = []
@@ -267,7 +280,15 @@ class FakeKnowledgeModel:
             "generated_by": self.model_id,
         }
 
-    async def suggest(self, markdown: str, structured: dict[str, Any], revision: int) -> dict[str, Any]:
+    async def suggest(
+        self,
+        markdown: str,
+        structured: dict[str, Any],
+        revision: int,
+        *,
+        mode: str = "CONSISTENCY",
+        instruction: str = "",
+    ) -> dict[str, Any]:
         rules = structured.get("rules", [])
         if rules:
             rule = rules[0]
@@ -279,11 +300,18 @@ class FakeKnowledgeModel:
             old_text = lines[0] if lines else markdown[:80]
             new_text = old_text + "\n- 复核要求：记录来源并在异常时转人工确认。"
             source_refs = []
+        mode_labels = {
+            "CONSISTENCY": "一致性检查",
+            "REGULATORY": "监管对齐",
+            "GAP": "查漏补缺",
+            "CUSTOM": "按意图改写",
+        }
+        intent = f"；已按指令“{instruction[:80]}”定位修改" if instruction else ""
         return {
             "base_revision": revision,
             "old_text": old_text,
             "new_text": new_text,
-            "explanation": "补充执行留痕与异常升级条件，避免规则只有动作而缺少审计闭环。",
+            "explanation": (f"{mode_labels.get(mode, '一致性检查')}发现执行动作缺少留痕与异常升级条件{intent}。"),
             "source_refs": source_refs,
         }
 
@@ -298,6 +326,33 @@ class FakeKnowledgeModel:
                 }
             )
         return items
+
+    async def generate_evaluation(
+        self,
+        structured: dict[str, Any],
+        qa_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        items = []
+        for rule in structured.get("rules", [])[:10]:
+            items.append(
+                {
+                    "input": f"请判断以下场景是否需要执行“{rule['title']}”，并说明依据。",
+                    "expected": rule["action"],
+                    "source_refs": rule.get("sources", []),
+                    "synthetic": True,
+                    "evaluation_status": "待评测",
+                }
+            )
+        return items or [
+            {
+                "input": item["question"],
+                "expected": item["answer"],
+                "source_refs": item.get("source_refs", []),
+                "synthetic": True,
+                "evaluation_status": "待评测",
+            }
+            for item in qa_items[:10]
+        ]
 
 
 def render_markdown(structured: dict[str, Any]) -> str:
@@ -384,7 +439,8 @@ async def generate_assets(
     scene_name: str,
     markdown: str,
     structured: dict[str, Any],
-    model: Any,
+    qa_model: Any,
+    evaluation_model: Any,
 ) -> list[AssetSpec]:
     output_dir.mkdir(parents=True, exist_ok=True)
     rules_path = output_dir / "knowledge-rules.xlsx"
@@ -400,21 +456,12 @@ async def generate_assets(
     thought_path.write_text("\n".join(rationale_lines) + "\n", encoding="utf-8")
     _write_skill_zip(skill_path, scene_name, markdown, structured)
 
-    qa_items = await model.generate_qa(structured)
+    qa_items = await qa_model.generate_qa(structured)
     qa_path.write_text(
         "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in qa_items),
         encoding="utf-8",
     )
-    eval_items = [
-        {
-            "input": item["question"],
-            "expected": item["answer"],
-            "source_refs": item["source_refs"],
-            "synthetic": True,
-            "evaluation_status": "待评测",
-        }
-        for item in qa_items
-    ]
+    eval_items = await evaluation_model.generate_evaluation(structured, qa_items)
     eval_path.write_text(
         "".join(json.dumps(item, ensure_ascii=False) + "\n" for item in eval_items),
         encoding="utf-8",
@@ -479,7 +526,7 @@ def chunk_refs_to_json(chunks: list[ChunkRef]) -> list[dict[str, Any]]:
             "material_name": chunk.material_name,
             "chunk_index": chunk.chunk_index,
             "score": chunk.score,
-            "text_sha256": hashlib.sha256(chunk.text.encode()).hexdigest(),
+            "text_sha256": chunk_text_sha256(chunk.text),
         }
         for chunk in chunks
     ]

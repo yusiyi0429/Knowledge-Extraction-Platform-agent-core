@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { ApiError, api, jsonBody, upload, watchJob } from "./api";
 import { Button, EmptyState, Icon, Modal, Notice, StatusBadge, formatDate } from "./components";
@@ -22,7 +22,7 @@ export function DashboardPage({ onOpenScene }: { onOpenScene: (sceneId: string) 
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
   const [status, setStatus] = useState("ALL");
-  const [newOpen, setNewOpen] = useState(false);
+  const [creatingScene, setCreatingScene] = useState(false);
   const [exploreOpen, setExploreOpen] = useState(false);
   const [archiveTarget, setArchiveTarget] = useState<SceneSummary | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -61,6 +61,21 @@ export function DashboardPage({ onOpenScene }: { onOpenScene: (sceneId: string) 
     }
   }
 
+  async function createScene() {
+    if (creatingScene) return;
+    setCreatingScene(true);
+    try {
+      const result = await api<{ scene: { id: string } }>("/scenes", {
+        method: "POST",
+        body: jsonBody({ name: "未命名知识场景", description: "", goal: "", subscenes: [] }),
+      });
+      onOpenScene(result.scene.id);
+    } catch (error) {
+      setNotice(messageOf(error));
+      setCreatingScene(false);
+    }
+  }
+
   const filteredLabel = useMemo(() => {
     if (loading) return "正在同步工作台数据";
     return `${scenes.length} 个可见场景`;
@@ -76,7 +91,9 @@ export function DashboardPage({ onOpenScene }: { onOpenScene: (sceneId: string) 
         </div>
         <div className="head-actions">
           <Button icon="spark" onClick={() => setExploreOpen(true)}>场景探索</Button>
-          <Button kind="primary" icon="plus" onClick={() => setNewOpen(true)}>新建场景</Button>
+          <Button kind="primary" icon="plus" onClick={() => void createScene()} disabled={creatingScene}>
+            {creatingScene ? "正在进入…" : "新建场景"}
+          </Button>
         </div>
       </header>
 
@@ -147,7 +164,6 @@ export function DashboardPage({ onOpenScene }: { onOpenScene: (sceneId: string) 
         )}
       </section>
 
-      <NewSceneModal open={newOpen} onClose={() => setNewOpen(false)} onCreated={onOpenScene} />
       <ExplorationModal open={exploreOpen} onClose={() => setExploreOpen(false)} onCreated={onOpenScene} />
       <Modal
         open={Boolean(archiveTarget)}
@@ -170,53 +186,6 @@ function Metric({ icon, value, label, foot }: { icon: "layers" | "book" | "check
       <h3>{label}</h3>
       <p>{foot}</p>
     </article>
-  );
-}
-
-function NewSceneModal({ open, onClose, onCreated }: { open: boolean; onClose: () => void; onCreated: (sceneId: string) => void }) {
-  const [name, setName] = useState("");
-  const [description, setDescription] = useState("");
-  const [goal, setGoal] = useState("");
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState("");
-
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    setSaving(true);
-    setError("");
-    try {
-      const result = await api<{ scene: { id: string } }>("/scenes", {
-        method: "POST",
-        body: jsonBody({ name, description, goal }),
-      });
-      setName("");
-      setDescription("");
-      setGoal("");
-      onClose();
-      onCreated(result.scene.id);
-    } catch (requestError) {
-      setError(messageOf(requestError));
-    } finally {
-      setSaving(false);
-    }
-  }
-
-  return (
-    <Modal
-      open={open}
-      title="新建知识场景"
-      subtitle="只填写必要信息，素材与子场景可在下一步继续完善。"
-      onClose={onClose}
-      footer={<><Button onClick={onClose}>取消</Button><Button kind="primary" disabled={saving || !name.trim()} onClick={() => document.getElementById("new-scene-submit")?.click()}>{saving ? "创建中…" : "创建并进入"}</Button></>}
-    >
-      <form className="form-stack" onSubmit={submit}>
-        {error && <Notice tone="danger">{error}</Notice>}
-        <label>场景名称<span>*</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：企业差旅费用审核" /></label>
-        <label>场景描述<textarea value={description} onChange={(event) => setDescription(event.target.value)} placeholder="说明业务范围、使用对象和当前痛点" /></label>
-        <label>萃取目标<textarea value={goal} onChange={(event) => setGoal(event.target.value)} placeholder="希望从素材中沉淀哪些规则、流程或问答" /></label>
-        <button id="new-scene-submit" type="submit" hidden />
-      </form>
-    </Modal>
   );
 }
 

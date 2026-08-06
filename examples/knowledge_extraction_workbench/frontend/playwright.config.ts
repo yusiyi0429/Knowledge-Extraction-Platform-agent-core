@@ -23,7 +23,7 @@ export default defineConfig({
     video: "retain-on-failure",
   },
   webServer: {
-    command: `cd "${repoRoot}" && WORKBENCH_DATA_DIR="${dataDir}" uv run python -m examples.knowledge_extraction_workbench.backend`,
+    command: `cd "${repoRoot}" && WORKBENCH_DATA_DIR="${dataDir}" WORKBENCH_TEST_MODEL=deterministic uv run python -m examples.knowledge_extraction_workbench.backend`,
     url: "http://127.0.0.1:8765/api/v1/health",
     reuseExistingServer: false,
     timeout: 120_000,

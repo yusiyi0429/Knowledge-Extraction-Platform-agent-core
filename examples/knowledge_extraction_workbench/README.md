@@ -8,8 +8,11 @@
 - `aiohttp + SQLModel + SQLite` 后端，生产构建由同一进程提供静态文件。
 - 使用 `AutoFileParser` 解析 PDF、DOCX、XLSX，并支持 CSV、TSV、TXT、MD。
 - 跨素材轮询配额与全文分桶取样，过滤短碎片，不采用“只取前 N 个 Chunk”。
-- 默认 `FakeKnowledgeModel` 可确定性跑通探索、Map/Reduce 萃取、对齐、QA 与评测资产。
-- 能力卡挂载真实模型后，新任务通过 `openjiuwen.core.foundation.llm.Model` 执行，并使用结构化 JSON 输出与一次携带原素材上下文的修复重试。
+- 产品不创建或展示 Fake Model；模型任务必须挂载已配置的真实 Provider。
+- 新任务通过 `openjiuwen.core.foundation.llm.Model` 执行，并使用结构化 JSON 输出、常见格式容错与一次携带原素材上下文的修复重试。
+- 对齐页面提供完整 AI 修改助手：一致性检查、监管对齐、查漏补缺、自然语言指令、差异预览、采纳/放弃与失败重试。
+- 7 个按需智能体按原型分为 2 个萃取/对齐能力和 5 个生成能力，支持场景级覆盖与配置导入导出。
+- Skill 库提供 6 个只读模板，以及可复制、编辑、下载、上传新版本和查看版本历史的场景实例。
 - SSE 任务事件、冻结配置、服务重启失败恢复、乐观修订并发、软归档和发布后不可变。
 - 生成规则 Excel、决策研判链 Markdown、openJiuwen Skill ZIP、QA JSONL 和合成评测 JSONL。
 - API Key 使用 AES-GCM 加密，主密钥文件权限为 `0600`；查询接口只返回 `has_api_key`。
@@ -55,16 +58,15 @@ npm run dev
 
 ## 模型接入
 
-工作台首次运行会创建“内置 Fake Model”，7 项能力默认都挂载它，因此不需要 API Key。
-
-接入真实模型时：
+工作台不会创建内置模型。接入真实模型时：
 
 1. 在“模型接入”新增 Provider、API 地址、模型名称与 API Key。
 2. 先点击“测试”，执行不包含素材正文的最小连接调用。
-3. 在“智能体与 Skill”把需要的能力卡切换到该模型。
+3. 在“智能体与 Skill”选择任意已启用连接，批量应用到 7 个能力；也可按场景、按智能体逐项配置。
 4. 之后启动的新 Job 会冻结 Provider、API 地址、模型名称、加密凭据、Skill、参数、素材哈希和模板版本。
 
-外部 API 地址必须使用 HTTPS；HTTP 只允许 `localhost`、`127.0.0.1` 或 `::1`。
+产品不会把 DeepSeek 或其他 Provider 写死为默认；存在多个可用连接时，批量应用必须明确选择模型。外部 API 地址必须使用 HTTPS；HTTP 只允许 `localhost`、`127.0.0.1` 或 `::1`。
+服务会自动使用系统受信任 CA 并保持严格 TLS 校验；私有 CA 可通过 `WORKBENCH_SSL_CERT` 指定，且证书必须位于 `SAFE_CERT_DIR` 内。
 
 ## 验证
 
@@ -72,6 +74,7 @@ npm run dev
 # Python 逻辑与 API 纵向流程
 uv run pytest -q \
   tests/unit_tests/examples/knowledge_extraction_workbench/test_pipeline.py \
+  tests/unit_tests/examples/knowledge_extraction_workbench/test_model_runtime.py \
   tests/system_tests/examples/knowledge_extraction_workbench/test_workbench_api.py
 
 # Python 静态检查
@@ -89,7 +92,7 @@ npm run build
 npm run test:e2e
 ```
 
-测试始终使用 Fake Model，不读取真实 API Key。真实模型只作为手工可选冒烟路径。
+自动化测试通过 `WORKBENCH_TEST_MODEL=deterministic` 或应用工厂参数显式注入确定性测试替身；它不会写入产品模型列表，也不读取真实 API Key。发布前可另行执行真实模型冒烟验证。
 
 ## 明确边界
 

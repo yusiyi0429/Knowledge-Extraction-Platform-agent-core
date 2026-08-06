@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import json
 import shutil
+import zipfile
 from datetime import datetime
 from pathlib import Path, PurePath
 from typing import Any
@@ -18,6 +20,7 @@ from sqlmodel import func, select
 from .config import SecretBox, Settings
 from .errors import WorkbenchError, error_middleware
 from .models import (
+    AbilityProfile,
     AbilityMount,
     Asset,
     Exploration,
@@ -34,9 +37,10 @@ from .models import (
     new_id,
     utc_now,
 )
+from .model_runtime import build_model_client_config, model_connection_error
 from .pipeline import SUPPORTED_EXTENSIONS, parse_material, validate_skill_zip
 from .service import REQUIRED_ASSET_KINDS, TERMINAL_JOB_STATUSES, WorkbenchService
-from .store import ABILITY_SPECS, DEFAULT_SKILLS, Store
+from .store import ABILITY_SPECS, Store
 
 APP_SETTINGS = web.AppKey("settings", Settings)
 APP_STORE = web.AppKey("store", Store)
@@ -176,20 +180,29 @@ def _model_dict(model: ModelConnection) -> dict[str, Any]:
 
 
 def _skill_dict(skill: SkillVersion) -> dict[str, Any]:
+    manifest = _json_loads(skill.manifest_json, {})
     return {
         "id": skill.id,
         "name": skill.name,
         "description": skill.description,
         "version": skill.version,
         "status": skill.status,
-        "built_in": bool(_json_loads(skill.manifest_json, {}).get("built_in")),
-        "manifest": _json_loads(skill.manifest_json, {}),
+        "built_in": bool(manifest.get("built_in")),
+        "kind": str(manifest.get("kind", "INSTANCE")),
+        "read_only": bool(manifest.get("read_only")),
+        "lineage_id": str(manifest.get("lineage_id", skill.id)),
+        "source_skill_id": manifest.get("source_skill_id"),
+        "source_name": str(manifest.get("source_name", "")),
+        "scene_name": str(manifest.get("scene_name", "")),
+        "notes": str(manifest.get("notes", "")),
+        "manifest": manifest,
         "created_at": _iso(skill.created_at),
+        "download_url": f"/api/v1/skills/{skill.id}/download",
     }
 
 
 async def health(_: web.Request) -> web.Response:
-    return web.json_response({"status": "ok", "mode": "local-demo", "model_runtime": "FakeModel"})
+    return web.json_response({"status": "ok", "mode": "local-demo", "model_runtime": "configured-provider"})
 
 
 async def api_not_found(_: web.Request) -> web.Response:
@@ -324,8 +337,9 @@ async def update_scene(request: web.Request) -> web.Response:
             session.add(latest)
         scene.updated_at = utc_now()
         session.add(scene)
+        response = {"id": scene.id, "name": scene.name, "updated_at": _iso(scene.updated_at)}
         session.commit()
-    return web.json_response({"id": scene.id, "name": scene.name, "updated_at": _iso(scene.updated_at)})
+    return web.json_response(response)
 
 
 async def archive_scene(request: web.Request) -> web.Response:
@@ -789,7 +803,12 @@ async def list_suggestions(request: web.Request) -> web.Response:
 
 
 async def create_suggestion(request: web.Request) -> web.Response:
-    suggestion = await request.app[APP_SERVICE].create_suggestion(request.match_info["round_id"])
+    payload = await _json_body(request) if request.can_read_body else {}
+    suggestion = await request.app[APP_SERVICE].create_suggestion(
+        request.match_info["round_id"],
+        mode=str(payload.get("mode", "CONSISTENCY")),
+        instruction=str(payload.get("instruction", "")),
+    )
     return web.json_response(_suggestion_dict(suggestion), status=201)
 
 
@@ -858,7 +877,7 @@ async def publish_round(request: web.Request) -> web.Response:
 
 def _validate_model_endpoint(provider: str, api_base: str) -> None:
     if provider == "FakeModel":
-        return
+        raise WorkbenchError("MODEL_PROVIDER_UNSUPPORTED", "产品运行不再支持 Fake Model。", status=422)
     parsed = urlparse(api_base)
     if parsed.scheme == "https" and parsed.hostname:
         return
@@ -874,7 +893,11 @@ def _validate_model_endpoint(provider: str, api_base: str) -> None:
 async def list_models(request: web.Request) -> web.Response:
     store = request.app[APP_STORE]
     with store.session() as session:
-        rows = session.exec(select(ModelConnection).order_by(ModelConnection.created_at)).all()
+        rows = session.exec(
+            select(ModelConnection)
+            .where(ModelConnection.provider != "FakeModel")
+            .order_by(ModelConnection.created_at)
+        ).all()
     return web.json_response({"items": [_model_dict(item) for item in rows]})
 
 
@@ -887,7 +910,7 @@ async def create_model(request: web.Request) -> web.Response:
     api_key = str(payload.get("api_key", "")).strip()
     if not name or not provider or not model_name:
         raise WorkbenchError("MODEL_FIELDS_REQUIRED", "名称、Provider 和模型名称为必填项。", status=422)
-    if provider != "FakeModel" and not api_key:
+    if not api_key:
         raise WorkbenchError("MODEL_API_KEY_REQUIRED", "请输入 API Key。", status=422)
     _validate_model_endpoint(provider, api_base)
     model = ModelConnection(
@@ -940,37 +963,33 @@ async def delete_model(request: web.Request) -> web.Response:
         model = session.get(ModelConnection, model_id)
         if model is None:
             raise WorkbenchError("MODEL_NOT_FOUND", "模型连接不存在。", status=404)
-        if model.provider == "FakeModel":
-            raise WorkbenchError("DEFAULT_MODEL_REQUIRED", "内置 Fake Model 不能删除。", status=409)
         mount = session.exec(select(AbilityMount).where(AbilityMount.model_connection_id == model_id)).first()
-        if mount:
+        profile = session.exec(select(AbilityProfile).where(AbilityProfile.model_connection_id == model_id)).first()
+        if mount or profile:
             raise WorkbenchError(
                 "MODEL_IN_USE",
                 "该模型仍被能力配置使用，请先更换挂载模型。",
                 status=409,
-                details={"ability_key": mount.ability_key},
+                details={"ability_key": mount.ability_key if mount else "SCENE_PROFILE"},
             )
         session.delete(model)
         session.commit()
     return web.json_response({"deleted": True})
 
 
-async def test_model(request: web.Request) -> web.Response:
+async def test_model_connection(request: web.Request) -> web.Response:
     store = request.app[APP_STORE]
     model = store.get(ModelConnection, request.match_info["model_id"], code="MODEL_NOT_FOUND")
-    if model.provider == "FakeModel":
-        await asyncio.sleep(0.08)
-        return web.json_response({"ok": True, "latency_ms": 80, "message": "Fake Model 可用"})
     if not model.encrypted_api_key:
         raise WorkbenchError("MODEL_API_KEY_REQUIRED", "该连接尚未保存 API Key。", status=422)
     _validate_model_endpoint(model.provider, model.api_base)
     started = asyncio.get_running_loop().time()
     try:
         from openjiuwen.core.foundation.llm import Model
-        from openjiuwen.core.foundation.llm.schema.config import ModelClientConfig, ModelRequestConfig
+        from openjiuwen.core.foundation.llm.schema.config import ModelRequestConfig
 
-        client = ModelClientConfig(
-            client_provider=model.provider,
+        client = build_model_client_config(
+            provider=model.provider,
             api_key=request.app[APP_SECRET_BOX].decrypt(model.encrypted_api_key),
             api_base=model.api_base,
             timeout=20,
@@ -979,13 +998,7 @@ async def test_model(request: web.Request) -> web.Response:
         runtime = Model(client, ModelRequestConfig(model=model.model_name, temperature=0, max_tokens=8))
         await runtime.invoke("仅回复 OK", model=model.model_name, timeout=20)
     except Exception as exc:
-        raise WorkbenchError(
-            "MODEL_REQUEST_FAILED",
-            "模型连接测试失败，请检查 Provider、地址、模型名称和密钥。",
-            status=502,
-            retryable=True,
-            details={"reason": type(exc).__name__},
-        ) from exc
+        raise model_connection_error(exc) from exc
     latency_ms = round((asyncio.get_running_loop().time() - started) * 1000)
     return web.json_response({"ok": True, "latency_ms": latency_ms, "message": "模型连接可用"})
 
@@ -993,11 +1006,15 @@ async def test_model(request: web.Request) -> web.Response:
 async def list_skills(request: web.Request) -> web.Response:
     store = request.app[APP_STORE]
     with store.session() as session:
-        rows = session.exec(select(SkillVersion).order_by(SkillVersion.created_at)).all()
+        rows = session.exec(
+            select(SkillVersion)
+            .where(SkillVersion.status == "ENABLED")
+            .order_by(SkillVersion.created_at)
+        ).all()
     return web.json_response({"items": [_skill_dict(item) for item in rows]})
 
 
-async def upload_skill(request: web.Request) -> web.Response:
+async def _receive_skill_zip(request: web.Request) -> tuple[Path, dict[str, Any]]:
     settings = request.app[APP_SETTINGS]
     try:
         reader = await request.multipart()
@@ -1008,9 +1025,9 @@ async def upload_skill(request: web.Request) -> web.Response:
         part = await reader.next()
     if part is None or not part.filename or Path(part.filename).suffix.lower() != ".zip":
         raise WorkbenchError("SKILL_ZIP_REQUIRED", "请选择 ZIP 格式 Skill 包。", status=422)
-    upload_id = new_id()
-    temporary = settings.skill_dir / f"{upload_id}.uploading"
-    final_path = settings.skill_dir / f"{upload_id}.zip"
+    package_id = new_id()
+    temporary = settings.skill_dir / f"{package_id}.uploading"
+    final_path = settings.skill_dir / f"{package_id}.zip"
     size = 0
     try:
         async with aiofiles.open(temporary, "wb") as stream:
@@ -1024,12 +1041,56 @@ async def upload_skill(request: web.Request) -> web.Response:
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
+    return final_path, manifest
+
+
+def _instance_manifest(
+    *,
+    lineage_id: str,
+    source: SkillVersion | None,
+    scene_name: str,
+    notes: str,
+    package_manifest: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    source_manifest = _json_loads(source.manifest_json, {}) if source else {}
+    return {
+        **(package_manifest or {}),
+        "built_in": False,
+        "kind": "INSTANCE",
+        "read_only": False,
+        "lineage_id": lineage_id,
+        "source_skill_id": source.id if source else None,
+        "source_name": source.name if source else str(source_manifest.get("source_name", "")),
+        "scene_name": scene_name,
+        "notes": notes,
+    }
+
+
+def _next_skill_version(version: str) -> str:
+    try:
+        major, minor, _patch = (int(part) for part in version.split(".", maxsplit=2))
+    except (TypeError, ValueError):
+        return "1.1.0"
+    return f"{major}.{minor + 1}.0"
+
+
+async def upload_skill(request: web.Request) -> web.Response:
+    final_path, manifest = await _receive_skill_zip(request)
     skill = SkillVersion(
         name=manifest["name"][:120],
         description=manifest["description"],
         version=str(request.query.get("version", "1.0.0"))[:40],
         package_path=str(final_path),
-        manifest_json=json.dumps(manifest, ensure_ascii=False),
+    )
+    skill.manifest_json = json.dumps(
+        _instance_manifest(
+            lineage_id=skill.id,
+            source=None,
+            scene_name=str(request.query.get("scene_name", "通用场景"))[:160],
+            notes="由本地 ZIP 导入",
+            package_manifest=manifest,
+        ),
+        ensure_ascii=False,
     )
     store = request.app[APP_STORE]
     with store.session() as session:
@@ -1040,84 +1101,399 @@ async def upload_skill(request: web.Request) -> web.Response:
     return web.json_response(_skill_dict(skill), status=201)
 
 
-async def list_ability_mounts(request: web.Request) -> web.Response:
+async def create_skill_instance(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    source_id = str(payload.get("source_skill_id") or payload.get("template_id") or "").strip()
+    if not source_id:
+        raise WorkbenchError("SKILL_SOURCE_REQUIRED", "请选择一个 Skill 模板或实例。", status=422)
     store = request.app[APP_STORE]
     with store.session() as session:
-        mounts = session.exec(select(AbilityMount).order_by(AbilityMount.display_name)).all()
-        models = {item.id: _model_dict(item) for item in session.exec(select(ModelConnection)).all()}
-        skills = {item.id: _skill_dict(item) for item in session.exec(select(SkillVersion)).all()}
-    return web.json_response(
-        {
-            "items": [
-                {
-                    "id": mount.id,
-                    "ability_key": mount.ability_key,
-                    "display_name": mount.display_name,
-                    "description": mount.description,
-                    "enabled": mount.enabled,
-                    "model_connection_id": mount.model_connection_id,
-                    "skill_version_id": mount.skill_version_id,
-                    "model": models.get(str(mount.model_connection_id)),
-                    "skill": skills.get(str(mount.skill_version_id)),
-                    "params": _json_loads(mount.params_json, {}),
-                    "updated_at": _iso(mount.updated_at),
-                }
-                for mount in mounts
-            ]
-        }
+        source = session.get(SkillVersion, source_id)
+        if source is None:
+            raise WorkbenchError("SKILL_NOT_FOUND", "Skill 模板或实例不存在。", status=404)
+        source_manifest = _json_loads(source.manifest_json, {})
+        name = str(payload.get("name", f"{source.name} 实例")).strip()
+        if not name:
+            raise WorkbenchError("SKILL_NAME_REQUIRED", "请输入 Skill 实例名称。", status=422)
+        skill = SkillVersion(
+            name=name[:120],
+            description=str(payload.get("description", source.description)).strip(),
+            version="0.1.0",
+            package_path=source.package_path,
+        )
+        template_source = source
+        if source_manifest.get("kind") == "INSTANCE" and source_manifest.get("source_skill_id"):
+            template_source = session.get(SkillVersion, str(source_manifest["source_skill_id"])) or source
+        skill.manifest_json = json.dumps(
+            _instance_manifest(
+                lineage_id=skill.id,
+                source=template_source,
+                scene_name=str(payload.get("scene_name", "通用场景")).strip()[:160] or "通用场景",
+                notes=str(payload.get("notes", "由模板复制，可独立维护版本。"))[:500],
+            ),
+            ensure_ascii=False,
+        )
+        session.add(skill)
+        session.commit()
+        session.refresh(skill)
+        session.expunge(skill)
+    return web.json_response(_skill_dict(skill), status=201)
+
+
+async def update_skill(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    store = request.app[APP_STORE]
+    with store.session() as session:
+        skill = session.get(SkillVersion, request.match_info["skill_id"])
+        if skill is None:
+            raise WorkbenchError("SKILL_NOT_FOUND", "Skill 不存在。", status=404)
+        manifest = _json_loads(skill.manifest_json, {})
+        if manifest.get("read_only"):
+            raise WorkbenchError("SKILL_TEMPLATE_READ_ONLY", "内置 Skill 模板为只读，请先复制为实例。", status=409)
+        if "name" in payload:
+            name = str(payload["name"]).strip()
+            if not name:
+                raise WorkbenchError("SKILL_NAME_REQUIRED", "请输入 Skill 实例名称。", status=422)
+            skill.name = name[:120]
+        if "description" in payload:
+            skill.description = str(payload["description"]).strip()
+        if "scene_name" in payload:
+            manifest["scene_name"] = str(payload["scene_name"]).strip()[:160] or "通用场景"
+        if "notes" in payload:
+            manifest["notes"] = str(payload["notes"]).strip()[:500]
+        skill.manifest_json = json.dumps(manifest, ensure_ascii=False)
+        session.add(skill)
+        session.commit()
+        session.refresh(skill)
+        session.expunge(skill)
+    return web.json_response(_skill_dict(skill))
+
+
+async def list_skill_versions(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    with store.session() as session:
+        skill = session.get(SkillVersion, request.match_info["skill_id"])
+        if skill is None:
+            raise WorkbenchError("SKILL_NOT_FOUND", "Skill 不存在。", status=404)
+        lineage_id = str(_json_loads(skill.manifest_json, {}).get("lineage_id", skill.id))
+        rows = [
+            item
+            for item in session.exec(select(SkillVersion).order_by(SkillVersion.created_at.desc())).all()
+            if str(_json_loads(item.manifest_json, {}).get("lineage_id", item.id)) == lineage_id
+        ]
+    return web.json_response({"items": [_skill_dict(item) for item in rows]})
+
+
+async def upload_skill_version(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    current = store.get(SkillVersion, request.match_info["skill_id"], code="SKILL_NOT_FOUND")
+    current_manifest = _json_loads(current.manifest_json, {})
+    if current_manifest.get("read_only"):
+        raise WorkbenchError("SKILL_TEMPLATE_READ_ONLY", "内置 Skill 模板不能上传新版本。", status=409)
+    final_path, package_manifest = await _receive_skill_zip(request)
+    with store.session() as session:
+        current = session.get(SkillVersion, current.id)
+        if current is None:
+            final_path.unlink(missing_ok=True)
+            raise WorkbenchError("SKILL_NOT_FOUND", "Skill 不存在。", status=404)
+        current_manifest = _json_loads(current.manifest_json, {})
+        version = str(request.query.get("version", _next_skill_version(current.version))).strip()
+        new_skill = SkillVersion(
+            name=str(package_manifest.get("name") or current.name)[:120],
+            description=str(package_manifest.get("description") or current.description),
+            version=version[:40],
+            package_path=str(final_path),
+            manifest_json=json.dumps(
+                _instance_manifest(
+                    lineage_id=str(current_manifest.get("lineage_id", current.id)),
+                    source=session.get(SkillVersion, str(current_manifest.get("source_skill_id")))
+                    if current_manifest.get("source_skill_id")
+                    else None,
+                    scene_name=str(current_manifest.get("scene_name", "通用场景")),
+                    notes=str(request.query.get("notes", "上传新版本"))[:500],
+                    package_manifest=package_manifest,
+                ),
+                ensure_ascii=False,
+            ),
+        )
+        current.status = "SUPERSEDED"
+        session.add(current)
+        session.add(new_skill)
+        session.flush()
+        for mount in session.exec(select(AbilityMount).where(AbilityMount.skill_version_id == current.id)).all():
+            mount.skill_version_id = new_skill.id
+            mount.updated_at = utc_now()
+            session.add(mount)
+        for profile in session.exec(
+            select(AbilityProfile).where(AbilityProfile.skill_version_id == current.id)
+        ).all():
+            profile.skill_version_id = new_skill.id
+            profile.updated_at = utc_now()
+            session.add(profile)
+        session.commit()
+        session.refresh(new_skill)
+        session.expunge(new_skill)
+    return web.json_response(_skill_dict(new_skill), status=201)
+
+
+def _generated_skill_zip(skill: SkillVersion) -> bytes:
+    manifest = _json_loads(skill.manifest_json, {})
+    skill_slug = str(manifest.get("slug") or skill.name).strip().lower().replace(" ", "-")
+    skill_md = (
+        "---\n"
+        f"name: {skill_slug or 'knowledge-workbench-skill'}\n"
+        f"description: {skill.description or skill.name}\n"
+        "---\n\n"
+        f"# {skill.name}\n\n"
+        "该包由知识萃取智能体工作台生成，包含可继续维护的 Skill 骨架。\n"
     )
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("SKILL.md", skill_md)
+        archive.writestr("references/README.md", "# References\n\n在此补充已审定知识和来源说明。\n")
+        archive.writestr("scripts/validate.py", "print('skill package ready')\n")
+        archive.writestr("assets/schema.json", json.dumps({"version": skill.version}, ensure_ascii=False))
+    return buffer.getvalue()
+
+
+async def download_skill(request: web.Request) -> web.StreamResponse:
+    skill = request.app[APP_STORE].get(
+        SkillVersion,
+        request.match_info["skill_id"],
+        code="SKILL_NOT_FOUND",
+    )
+    headers = {"Content-Disposition": f'attachment; filename="skill-{skill.id[:8]}-{skill.version}.zip"'}
+    path = Path(skill.package_path) if skill.package_path else None
+    if path and path.is_file():
+        response = web.FileResponse(path, headers=headers)
+        response.content_type = "application/zip"
+        return response
+    return web.Response(body=_generated_skill_zip(skill), content_type="application/zip", headers=headers)
+
+
+def _ability_items(session: Any, scope_key: str) -> list[dict[str, Any]]:
+    mounts = {item.ability_key: item for item in session.exec(select(AbilityMount)).all()}
+    profiles = {
+        item.mount_id: item
+        for item in session.exec(select(AbilityProfile).where(AbilityProfile.scope_key == scope_key)).all()
+    }
+    models = {
+        item.id: _model_dict(item)
+        for item in session.exec(select(ModelConnection).where(ModelConnection.provider != "FakeModel")).all()
+    }
+    skills = {item.id: _skill_dict(item) for item in session.exec(select(SkillVersion)).all()}
+    items = []
+    for spec in ABILITY_SPECS:
+        mount = mounts.get(spec["key"])
+        if mount is None:
+            continue
+        profile = profiles.get(mount.id) if scope_key != "GLOBAL" else None
+        enabled = profile.enabled if profile else mount.enabled
+        model_id = profile.model_connection_id if profile else mount.model_connection_id
+        skill_id = profile.skill_version_id if profile else mount.skill_version_id
+        params_json = profile.params_json if profile else mount.params_json
+        items.append(
+            {
+                "id": mount.id,
+                "profile_id": profile.id if profile else None,
+                "scope_key": scope_key,
+                "inherited": scope_key != "GLOBAL" and profile is None,
+                "ability_key": mount.ability_key,
+                "display_name": mount.display_name,
+                "description": mount.description,
+                "stage": spec["stage"],
+                "trigger": spec["trigger"],
+                "location": spec["location"],
+                "enabled": enabled,
+                "model_connection_id": model_id,
+                "skill_version_id": skill_id,
+                "model": models.get(str(model_id)),
+                "skill": skills.get(str(skill_id)),
+                "params": _json_loads(params_json, {}),
+                "updated_at": _iso(profile.updated_at if profile else mount.updated_at),
+            }
+        )
+    return items
+
+
+def _apply_ability_payload(
+    session: Any,
+    mount: AbilityMount,
+    scope_key: str,
+    payload: dict[str, Any],
+) -> None:
+    profile = None
+    if scope_key != "GLOBAL":
+        profile = session.exec(
+            select(AbilityProfile).where(
+                AbilityProfile.mount_id == mount.id,
+                AbilityProfile.scope_key == scope_key,
+            )
+        ).first()
+        if profile is None:
+            profile = AbilityProfile(
+                mount_id=mount.id,
+                scope_key=scope_key,
+                enabled=mount.enabled,
+                model_connection_id=mount.model_connection_id,
+                skill_version_id=mount.skill_version_id,
+                params_json=mount.params_json,
+            )
+
+    target = profile or mount
+    if "model_connection_id" in payload:
+        model_id = payload["model_connection_id"] or None
+        model = session.get(ModelConnection, model_id) if model_id else None
+        if model_id and (
+            model is None
+            or model.provider == "FakeModel"
+            or not model.enabled
+            or not model.encrypted_api_key
+        ):
+            raise WorkbenchError("MODEL_NOT_FOUND", "模型连接不存在或不可用。", status=404)
+        target.model_connection_id = model_id
+    if "skill_version_id" in payload:
+        skill_id = payload["skill_version_id"] or None
+        skill = session.get(SkillVersion, skill_id) if skill_id else None
+        if skill_id and (skill is None or skill.status != "ENABLED"):
+            raise WorkbenchError("SKILL_NOT_FOUND", "Skill 不存在或已停用。", status=404)
+        target.skill_version_id = skill_id
+    if "enabled" in payload:
+        target.enabled = bool(payload["enabled"])
+    if "params" in payload:
+        params = payload["params"]
+        if not isinstance(params, dict):
+            raise WorkbenchError("ABILITY_PARAMS_INVALID", "能力参数必须是 JSON 对象。", status=422)
+        existing = _json_loads(target.params_json, {})
+        target.params_json = json.dumps(existing | params, ensure_ascii=False)
+    target.updated_at = utc_now()
+    session.add(target)
+
+
+async def list_ability_scopes(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    items = [{"key": "GLOBAL", "label": "通用场景（默认配置）", "kind": "GLOBAL"}]
+    with store.session() as session:
+        scenes = session.exec(
+            select(Scene).where(Scene.archived_at.is_(None)).order_by(Scene.created_at.desc())
+        ).all()
+        for scene in scenes:
+            items.append({"key": f"SCENE:{scene.id}", "label": scene.name, "kind": "SCENE"})
+            latest = session.exec(
+                select(ExtractionRound)
+                .where(ExtractionRound.scene_id == scene.id)
+                .order_by(ExtractionRound.version.desc())
+            ).first()
+            subscenes = _json_loads(latest.subscenes_json, []) if latest else []
+            for index, subscene in enumerate(subscenes):
+                if str(subscene).strip():
+                    items.append(
+                        {
+                            "key": f"SUBSCENE:{scene.id}:{index}",
+                            "label": f"{scene.name} › {str(subscene).strip()}",
+                            "kind": "SUBSCENE",
+                        }
+                    )
+    return web.json_response({"items": items})
+
+
+async def list_ability_mounts(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    scope_key = request.query.get("scope_key", "GLOBAL").strip() or "GLOBAL"
+    with store.session() as session:
+        items = _ability_items(session, scope_key)
+    return web.json_response({"scope_key": scope_key, "items": items})
 
 
 async def update_ability_mount(request: web.Request) -> web.Response:
     payload = await _json_body(request)
     store = request.app[APP_STORE]
     mount_id = request.match_info["mount_id"]
+    scope_key = str(payload.get("scope_key", request.query.get("scope_key", "GLOBAL"))).strip() or "GLOBAL"
     with store.session() as session:
         mount = session.get(AbilityMount, mount_id)
         if mount is None:
             raise WorkbenchError("ABILITY_MOUNT_NOT_FOUND", "能力配置不存在。", status=404)
-        if "model_connection_id" in payload:
-            model_id = payload["model_connection_id"] or None
-            if model_id and session.get(ModelConnection, model_id) is None:
-                raise WorkbenchError("MODEL_NOT_FOUND", "模型连接不存在。", status=404)
-            mount.model_connection_id = model_id
-        if "skill_version_id" in payload:
-            skill_id = payload["skill_version_id"] or None
-            if skill_id and session.get(SkillVersion, skill_id) is None:
-                raise WorkbenchError("SKILL_NOT_FOUND", "Skill 不存在。", status=404)
-            mount.skill_version_id = skill_id
-        if "enabled" in payload:
-            mount.enabled = bool(payload["enabled"])
-        if "params" in payload:
-            params = payload["params"]
-            if not isinstance(params, dict):
-                raise WorkbenchError("ABILITY_PARAMS_INVALID", "能力参数必须是 JSON 对象。", status=422)
-            mount.params_json = json.dumps(params, ensure_ascii=False)
-        mount.updated_at = utc_now()
-        session.add(mount)
+        _apply_ability_payload(session, mount, scope_key, payload)
         session.commit()
-    return web.json_response({"updated": True, "id": mount_id})
+        item = next(row for row in _ability_items(session, scope_key) if row["id"] == mount_id)
+    return web.json_response(item)
+
+
+async def import_ability_configuration(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    scope_key = str(payload.get("scope_key", "GLOBAL")).strip() or "GLOBAL"
+    rows = payload.get("items")
+    if not isinstance(rows, list):
+        raise WorkbenchError("ABILITY_CONFIG_INVALID", "导入配置缺少 items 数组。", status=422)
+    store = request.app[APP_STORE]
+    with store.session() as session:
+        mounts = {item.ability_key: item for item in session.exec(select(AbilityMount)).all()}
+        for row in rows:
+            if not isinstance(row, dict) or str(row.get("ability_key", "")) not in mounts:
+                raise WorkbenchError("ABILITY_CONFIG_INVALID", "导入配置包含未知智能体。", status=422)
+            _apply_ability_payload(session, mounts[str(row["ability_key"])], scope_key, row)
+        session.commit()
+        items = _ability_items(session, scope_key)
+    return web.json_response({"scope_key": scope_key, "items": items})
 
 
 async def reset_ability_mounts(request: web.Request) -> web.Response:
+    payload = await _json_body(request) if request.can_read_body and request.content_length else {}
+    scope_key = str(payload.get("scope_key", "GLOBAL")).strip() or "GLOBAL"
+    requested_model_id = str(payload.get("model_connection_id", "")).strip()
     store = request.app[APP_STORE]
     with store.session() as session:
-        fake = session.exec(select(ModelConnection).where(ModelConnection.provider == "FakeModel")).first()
-        skills = {item.name: item for item in session.exec(select(SkillVersion)).all()}
-        skill_order = [skills[item[0]] for item in DEFAULT_SKILLS]
-        mounts = {item.ability_key: item for item in session.exec(select(AbilityMount)).all()}
-        for index, (key, _, _) in enumerate(ABILITY_SPECS):
-            mount = mounts[key]
-            mount.enabled = True
-            mount.model_connection_id = fake.id if fake else None
-            mount.skill_version_id = skill_order[min(index // 2, len(skill_order) - 1)].id
-            mount.params_json = json.dumps(
-                {"temperature": 0.2, "max_chunks": 24, "concurrency": 3}, ensure_ascii=False
+        models = session.exec(
+            select(ModelConnection)
+            .where(ModelConnection.provider != "FakeModel", ModelConnection.enabled == True)  # noqa: E712
+            .order_by(ModelConnection.created_at)
+        ).all()
+        available_models = [item for item in models if item.encrypted_api_key]
+        if requested_model_id:
+            selected_model = next((item for item in available_models if item.id == requested_model_id), None)
+            if selected_model is None:
+                raise WorkbenchError(
+                    "MODEL_NOT_AVAILABLE",
+                    "所选模型连接不存在、已停用或缺少 API Key。",
+                    status=422,
+                )
+        elif len(available_models) == 1:
+            selected_model = available_models[0]
+        elif len(available_models) > 1:
+            raise WorkbenchError(
+                "MODEL_SELECTION_REQUIRED",
+                "存在多个可用模型，请先选择要批量应用的模型。",
+                status=422,
+                details={"available_count": len(available_models)},
             )
-            mount.updated_at = utc_now()
-            session.add(mount)
+        else:
+            selected_model = None
+        if selected_model is None:
+            raise WorkbenchError("MODEL_REQUIRED", "请先接入并测试一个真实模型。", status=409)
+        skills = {}
+        for item in session.exec(select(SkillVersion).where(SkillVersion.status == "ENABLED")).all():
+            slug = _json_loads(item.manifest_json, {}).get("slug")
+            if slug:
+                skills[str(slug)] = item
+        mounts = {item.ability_key: item for item in session.exec(select(AbilityMount)).all()}
+        for spec in ABILITY_SPECS:
+            mount = mounts[spec["key"]]
+            skill = skills.get(spec["skill_slug"])
+            _apply_ability_payload(
+                session,
+                mount,
+                scope_key,
+                {
+                    "enabled": True,
+                    "model_connection_id": selected_model.id,
+                    "skill_version_id": skill.id if skill else None,
+                    "params": spec["defaults"],
+                },
+            )
         session.commit()
-    return web.json_response({"reset": True})
+        items = _ability_items(session, scope_key)
+    return web.json_response({"reset": True, "scope_key": scope_key, "items": items})
 
 
 async def serve_index(request: web.Request) -> web.StreamResponse:
@@ -1145,13 +1521,13 @@ async def serve_static(request: web.Request) -> web.StreamResponse:
     return await serve_index(request)
 
 
-def create_app(settings: Settings | None = None) -> web.Application:
+def create_app(settings: Settings | None = None, *, test_model: Any | None = None) -> web.Application:
     settings = settings or Settings.from_env()
     settings.ensure_directories()
     store = Store(settings.database_path)
     store.initialize()
     secret_box = SecretBox(settings.key_path)
-    service = WorkbenchService(settings, store, secret_box)
+    service = WorkbenchService(settings, store, secret_box, test_model=test_model)
     app = web.Application(middlewares=[error_middleware], client_max_size=settings.max_upload_bytes + 1024 * 1024)
     app[APP_SETTINGS] = settings
     app[APP_STORE] = store
@@ -1199,10 +1575,17 @@ def create_app(settings: Settings | None = None) -> web.Application:
     app.router.add_post("/api/v1/models", create_model)
     app.router.add_put("/api/v1/models/{model_id}", update_model)
     app.router.add_delete("/api/v1/models/{model_id}", delete_model)
-    app.router.add_post("/api/v1/models/{model_id}/test", test_model)
+    app.router.add_post("/api/v1/models/{model_id}/test", test_model_connection)
     app.router.add_get("/api/v1/skills", list_skills)
     app.router.add_post("/api/v1/skills", upload_skill)
+    app.router.add_post("/api/v1/skills/instances", create_skill_instance)
+    app.router.add_put("/api/v1/skills/{skill_id}", update_skill)
+    app.router.add_get("/api/v1/skills/{skill_id}/versions", list_skill_versions)
+    app.router.add_post("/api/v1/skills/{skill_id}/versions", upload_skill_version)
+    app.router.add_get("/api/v1/skills/{skill_id}/download", download_skill)
+    app.router.add_get("/api/v1/ability-scopes", list_ability_scopes)
     app.router.add_get("/api/v1/ability-mounts", list_ability_mounts)
+    app.router.add_put("/api/v1/ability-mounts/configuration", import_ability_configuration)
     app.router.add_post("/api/v1/ability-mounts/defaults", reset_ability_mounts)
     app.router.add_put("/api/v1/ability-mounts/{mount_id}", update_ability_mount)
     app.router.add_route("*", "/api/{path:.*}", api_not_found)

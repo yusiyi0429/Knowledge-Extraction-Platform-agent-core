@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
+import openai
+from json_repair import repair_json
+from openjiuwen.core.common.exception.errors import BaseError
 from openjiuwen.core.foundation.llm import (
-    JsonOutputParser,
     Model,
     ModelClientConfig,
     ModelRequestConfig,
@@ -14,8 +17,110 @@ from openjiuwen.core.foundation.llm import (
     UserMessage,
 )
 
+from .config import trusted_ca_bundle
 from .errors import WorkbenchError
 from .pipeline import ChunkRef
+
+
+def build_model_client_config(
+    *,
+    provider: str,
+    api_key: str,
+    api_base: str,
+    timeout: float,
+    max_retries: int,
+) -> ModelClientConfig:
+    """Build a real-provider client with strict TLS verification enabled."""
+
+    return ModelClientConfig(
+        client_provider=provider,
+        api_key=api_key,
+        api_base=api_base,
+        timeout=timeout,
+        max_retries=max_retries,
+        verify_ssl=True,
+        ssl_cert=trusted_ca_bundle(),
+    )
+
+
+def model_connection_error(exc: Exception) -> WorkbenchError:
+    """Map provider failures to stable, secret-safe workbench errors."""
+
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        chain.append(current)
+        seen.add(id(current))
+        current = current.__cause__
+
+    reason = type(chain[-1]).__name__
+    if any(isinstance(item, openai.AuthenticationError) for item in chain):
+        return WorkbenchError(
+            "MODEL_AUTHENTICATION_FAILED",
+            "模型服务拒绝了 API Key，请重新保存有效密钥。",
+            status=401,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, openai.PermissionDeniedError) for item in chain):
+        return WorkbenchError(
+            "MODEL_ACCESS_DENIED",
+            "当前 API Key 没有调用该模型的权限。",
+            status=403,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, openai.NotFoundError) for item in chain):
+        return WorkbenchError(
+            "MODEL_NOT_FOUND",
+            "模型服务地址或模型名称不存在，请检查后重试。",
+            status=422,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, openai.RateLimitError) for item in chain):
+        return WorkbenchError(
+            "MODEL_RATE_LIMITED",
+            "模型服务当前限流，请稍后重试。",
+            status=429,
+            retryable=True,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, openai.APITimeoutError) for item in chain):
+        return WorkbenchError(
+            "MODEL_REQUEST_TIMEOUT",
+            "连接模型服务超时，请检查网络后重试。",
+            status=504,
+            retryable=True,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, openai.APIConnectionError) for item in chain):
+        return WorkbenchError(
+            "MODEL_UNAVAILABLE",
+            "无法连接模型服务，请检查 API 地址和网络。",
+            status=502,
+            retryable=True,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, openai.BadRequestError) for item in chain):
+        return WorkbenchError(
+            "MODEL_REQUEST_INVALID",
+            "模型服务拒绝了测试请求，请检查模型名称和 API 地址。",
+            status=422,
+            details={"reason": reason},
+        )
+    if any(isinstance(item, BaseError) and item.code in {181000, 181002, 181003, 181005} for item in chain):
+        return WorkbenchError(
+            "MODEL_CONFIGURATION_INVALID",
+            "模型客户端配置无法初始化，请检查 Provider、地址和本机 TLS 配置。",
+            status=422,
+            details={"reason": reason},
+        )
+    return WorkbenchError(
+        "MODEL_REQUEST_FAILED",
+        "模型连接测试失败，请检查 Provider、地址、模型名称和密钥。",
+        status=502,
+        retryable=True,
+        details={"reason": reason},
+    )
 
 
 class OpenJiuwenKnowledgeModel:
@@ -33,16 +138,59 @@ class OpenJiuwenKnowledgeModel:
         self.model_id = f"{provider}:{model_name}"
         self._model_name = model_name
         self._temperature = temperature
-        self._parser = JsonOutputParser()
-        client_config = ModelClientConfig(
-            client_provider=provider,
+        client_config = build_model_client_config(
+            provider=provider,
             api_key=api_key,
             api_base=api_base,
             timeout=90,
             max_retries=1,
         )
-        request_config = ModelRequestConfig(model=model_name, temperature=temperature, max_tokens=4096)
+        request_config = ModelRequestConfig(model=model_name, temperature=temperature, max_tokens=8192)
         self._model = Model(client_config, request_config)
+
+    @staticmethod
+    def _decode_json(content: Any) -> Any | None:
+        if isinstance(content, dict):
+            return content
+        if isinstance(content, list):
+            text_parts = []
+            for item in content:
+                if isinstance(item, str):
+                    text_parts.append(item)
+                elif isinstance(item, dict) and isinstance(item.get("text"), str):
+                    text_parts.append(item["text"])
+            if text_parts:
+                content = "\n".join(text_parts)
+            else:
+                return content
+        if not isinstance(content, str):
+            return None
+        text = content.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].strip().lower() in {"```", "```json"}:
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        candidates = [text]
+        object_start, object_end = text.find("{"), text.rfind("}")
+        array_start, array_end = text.find("["), text.rfind("]")
+        if object_start >= 0 and object_end > object_start:
+            candidates.append(text[object_start : object_end + 1])
+        if array_start >= 0 and array_end > array_start:
+            candidates.append(text[array_start : array_end + 1])
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                try:
+                    parsed = repair_json(candidate, return_objects=True)
+                except (TypeError, ValueError):
+                    continue
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        return None
 
     async def _invoke_json(self, instruction: str, context: str) -> Any:
         messages = [
@@ -71,19 +219,12 @@ class OpenJiuwenKnowledgeModel:
                     current_messages,
                     model=self._model_name,
                     temperature=self._temperature,
-                    output_parser=self._parser,
                     timeout=90,
                 )
             except Exception as exc:
-                raise WorkbenchError(
-                    "MODEL_REQUEST_FAILED",
-                    "模型请求失败，请检查连接状态后重试。",
-                    status=502,
-                    retryable=True,
-                    details={"reason": type(exc).__name__},
-                ) from exc
-            parsed = response.parser_content
-            if isinstance(parsed, (dict, list)):
+                raise model_connection_error(exc) from exc
+            parsed = self._decode_json(response.content)
+            if parsed is not None:
                 return parsed
             invalid_content = response.content if isinstance(response.content, str) else str(response.content)
         raise WorkbenchError(
@@ -181,50 +322,124 @@ class OpenJiuwenKnowledgeModel:
         return {"rules": rules, "source": chunk.source_ref()}
 
     async def reduce(self, mapped: list[dict[str, Any]], scene_name: str) -> dict[str, Any]:
-        payload = await self._invoke_json(
-            (
-                "合并、去重规则并检测冲突，不丢失 sources。返回对象："
-                '{"rules":[{"title":"...","condition":"...","action":"...","exceptions":"...",'
-                '"sources":[...]}],"process":[{"step":1,"name":"...","description":"...","sources":[...]}],'
-                '"conflicts":["..."]}。'
-            ),
-            json.dumps({"scene": scene_name, "mapped": mapped}, ensure_ascii=False),
-        )
-        if not isinstance(payload, dict) or not isinstance(payload.get("rules"), list):
-            raise WorkbenchError("MODEL_JSON_INVALID", "模型归并结果结构无效。", status=422, retryable=True)
-        rules = []
-        for item in payload["rules"][:30]:
-            if not isinstance(item, dict) or not str(item.get("action", "")).strip():
+        def key(value: Any) -> str:
+            return re.sub(r"[\W_]+", "", str(value), flags=re.UNICODE).casefold()
+
+        rules: list[dict[str, Any]] = []
+        rules_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        actions_by_scope: dict[tuple[str, str], set[str]] = {}
+        scope_labels: dict[tuple[str, str], str] = {}
+        for batch in mapped:
+            rows = batch.get("rules", []) if isinstance(batch, dict) else []
+            if not isinstance(rows, list):
                 continue
-            rules.append(
-                {
+            for item in rows:
+                if not isinstance(item, dict) or not str(item.get("action", "")).strip():
+                    continue
+                title = str(item.get("title") or f"规则 {len(rules) + 1}")[:120]
+                condition = str(item.get("condition") or "原文未明确条件")[:500]
+                action = str(item["action"])[:1000]
+                exceptions = str(item.get("exceptions") or "原文未明确例外，需业务复核")[:500]
+                sources = item.get("sources", []) if isinstance(item.get("sources"), list) else []
+                rule_key = (key(title), key(condition), key(action))
+                scope_key = rule_key[:2]
+                actions_by_scope.setdefault(scope_key, set()).add(rule_key[2])
+                scope_labels.setdefault(scope_key, title)
+                existing = rules_by_key.get(rule_key)
+                if existing is not None:
+                    known_sources = {
+                        json.dumps(source, ensure_ascii=False, sort_keys=True)
+                        for source in existing["sources"]
+                        if isinstance(source, dict)
+                    }
+                    for source in sources:
+                        if not isinstance(source, dict):
+                            continue
+                        source_key = json.dumps(source, ensure_ascii=False, sort_keys=True)
+                        if source_key not in known_sources:
+                            existing["sources"].append(source)
+                            known_sources.add(source_key)
+                    continue
+                rule = {
                     "id": f"R-{len(rules) + 1:03d}",
-                    "title": str(item.get("title", f"规则 {len(rules) + 1}"))[:120],
-                    "condition": str(item.get("condition", "原文未明确条件"))[:500],
-                    "action": str(item["action"])[:1000],
-                    "exceptions": str(item.get("exceptions", "原文未明确例外，需业务复核"))[:500],
-                    "sources": item.get("sources", []),
+                    "title": title,
+                    "condition": condition,
+                    "action": action,
+                    "exceptions": exceptions,
+                    "sources": [source for source in sources if isinstance(source, dict)],
                 }
-            )
+                rules.append(rule)
+                rules_by_key[rule_key] = rule
         if not rules:
             raise WorkbenchError("EXTRACTION_RESULT_EMPTY", "模型未返回可用规则。", status=422, retryable=True)
-        process = payload.get("process") if isinstance(payload.get("process"), list) else []
+        rules = rules[:30]
+        process = [
+            {
+                "step": index,
+                "name": rule["title"],
+                "description": rule["action"],
+                "sources": rule["sources"],
+            }
+            for index, rule in enumerate(rules[:20], start=1)
+        ]
+        conflicts = [
+            f"“{scope_labels[scope_key]}”在相同适用条件下存在不同执行动作，需人工复核。"
+            for scope_key, actions in actions_by_scope.items()
+            if len(actions) > 1
+        ]
         return {
             "schema_version": "1.0",
             "scene": scene_name,
             "rules": rules,
-            "process": process[:20],
-            "conflicts": payload.get("conflicts", []) if isinstance(payload.get("conflicts"), list) else [],
+            "process": process,
+            "conflicts": conflicts,
             "generated_by": self.model_id,
         }
 
-    async def suggest(self, markdown: str, structured: dict[str, Any], revision: int) -> dict[str, Any]:
+    async def suggest(
+        self,
+        markdown: str,
+        structured: dict[str, Any],
+        revision: int,
+        *,
+        mode: str = "CONSISTENCY",
+        instruction: str = "",
+    ) -> dict[str, Any]:
+        mode_guidance = {
+            "CONSISTENCY": "检查规则之间的前提、结论、例外和人工升级条件是否互相矛盾。",
+            "REGULATORY": "依据当前素材引用检查监管口径是否一致；没有素材依据时不得虚构外部条款。",
+            "GAP": "查找当前规则或流程遗漏的常见分支、边界条件和异常处理。",
+            "CUSTOM": "严格按照用户给出的修改意图定位并改写对应段落。",
+        }
+        requested_change = instruction.strip() or mode_guidance.get(mode, mode_guidance["CONSISTENCY"])
+        source_catalog = [
+            {
+                "rule_id": rule.get("id"),
+                "title": rule.get("title"),
+                "source_refs": rule.get("sources", []),
+            }
+            for rule in structured.get("rules", [])
+            if isinstance(rule, dict)
+        ]
         payload = await self._invoke_json(
             (
-                "提出一条最重要且可审查的差异建议。old_text 必须逐字存在于 markdown。返回对象："
-                '{"old_text":"...","new_text":"...","explanation":"...","source_refs":[...]}。'
+                f"任务类型：{mode}。用户意图：{requested_change}。"
+                "只提出一条最重要且可审查的差异建议；不要直接重写整篇文档。"
+                "old_text 必须从 markdown 逐字复制一个连续片段，new_text 是替换后的完整片段。"
+                "source_refs 只能从 source_catalog 复制；没有可靠来源时返回空数组。"
+                "严格返回对象："
+                '{"old_text":"原文连续片段","new_text":"替换后的完整片段",'
+                '"explanation":"修改原因","source_refs":[]}。'
             ),
-            json.dumps({"markdown": markdown, "structured": structured, "revision": revision}, ensure_ascii=False),
+            json.dumps(
+                {
+                    "revision": revision,
+                    "markdown": markdown,
+                    "known_conflicts": structured.get("conflicts", []),
+                    "source_catalog": source_catalog,
+                },
+                ensure_ascii=False,
+            ),
         )
         if not isinstance(payload, dict) or not str(payload.get("old_text", "")):
             raise WorkbenchError("MODEL_JSON_INVALID", "模型建议结构无效。", status=422, retryable=True)
@@ -259,3 +474,40 @@ class OpenJiuwenKnowledgeModel:
             for item in items[:20]
             if isinstance(item, dict) and item.get("question") and item.get("answer")
         ]
+
+    async def generate_evaluation(
+        self,
+        structured: dict[str, Any],
+        qa_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        payload = await self._invoke_json(
+            (
+                "直接基于规则和 QA 构造最多 8 条简洁的边界或异常场景评测样本，不要解释过程，"
+                "不要简单复述问题，每个 input 和 expected 不超过 200 字。返回对象："
+                '{"items":[{"input":"...","expected":"...","source_refs":[...]}]}。'
+            ),
+            json.dumps(
+                {
+                    "rules": structured.get("rules", [])[:8],
+                    "qa_items": qa_items[:8],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise WorkbenchError("MODEL_JSON_INVALID", "模型评测集结构无效。", status=422, retryable=True)
+        normalized = [
+            {
+                "input": str(item.get("input", "")),
+                "expected": str(item.get("expected", "")),
+                "source_refs": item.get("source_refs", []),
+                "synthetic": True,
+                "evaluation_status": "待评测",
+            }
+            for item in items[:20]
+            if isinstance(item, dict) and item.get("input") and item.get("expected")
+        ]
+        if not normalized:
+            raise WorkbenchError("EVALUATION_RESULT_EMPTY", "模型未返回可用评测样本。", status=422, retryable=True)
+        return normalized

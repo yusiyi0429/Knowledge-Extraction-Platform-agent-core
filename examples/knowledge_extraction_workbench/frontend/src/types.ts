@@ -154,22 +154,57 @@ export interface SkillVersion {
   version: string;
   status: string;
   built_in: boolean;
+  kind: "TEMPLATE" | "INSTANCE";
+  read_only: boolean;
+  lineage_id: string;
+  source_skill_id: string | null;
+  source_name: string;
+  scene_name: string;
+  notes: string;
   manifest: Record<string, unknown>;
   created_at: string;
+  download_url: string;
+}
+
+export interface AbilityParams {
+  [key: string]: string | number | boolean | undefined;
+  temperature?: number;
+  max_chunks?: number;
+  concurrency?: number;
+  stability?: string;
+  output_format?: string;
+  few_shot_count?: number;
+  package_format?: string;
+  question_style?: string;
+  density?: string;
+  test_split?: number;
+  boundary_coverage?: string;
 }
 
 export interface AbilityMount {
   id: string;
+  profile_id: string | null;
+  scope_key: string;
+  inherited: boolean;
   ability_key: string;
   display_name: string;
   description: string;
+  stage: "EXTRACTION" | "GENERATION";
+  trigger: string;
+  location: string;
   enabled: boolean;
   model_connection_id: string | null;
   skill_version_id: string | null;
   model: ModelConnection | null;
   skill: SkillVersion | null;
-  params: { temperature?: number; max_chunks?: number; concurrency?: number };
+  params: AbilityParams;
   updated_at: string;
+}
+
+export interface AbilityScope {
+  key: string;
+  label: string;
+  kind: "GLOBAL" | "SCENE" | "SUBSCENE";
 }
 
 export interface Candidate {

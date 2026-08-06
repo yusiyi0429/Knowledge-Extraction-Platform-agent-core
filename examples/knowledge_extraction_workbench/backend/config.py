@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import ssl
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -85,3 +86,32 @@ class SecretBox:
         nonce, tag, ciphertext = packed[:16], packed[16:32], packed[32:]
         cipher = AES.new(self._key, AES.MODE_GCM, nonce=nonce)
         return cipher.decrypt_and_verify(ciphertext, tag).decode("utf-8")
+
+
+def trusted_ca_bundle() -> str:
+    """Return a trusted CA bundle accepted by openJiuwen's strict TLS client."""
+
+    configured = os.environ.get("WORKBENCH_SSL_CERT", "").strip()
+    if configured:
+        certificate = Path(configured).expanduser().resolve()
+    else:
+        default_certificate = ssl.get_default_verify_paths().cafile
+        certificate = Path(default_certificate).resolve() if default_certificate else Path()
+        if not certificate.is_file():
+            # requests is a declared runtime dependency and ships a portable CA bundle.
+            from requests.certs import where
+
+            certificate = Path(where()).resolve()
+
+    if not certificate.is_file():
+        raise RuntimeError("Workbench TLS CA bundle does not exist")
+
+    safe_directory_value = os.environ.get("SAFE_CERT_DIR", "").strip()
+    if safe_directory_value:
+        safe_directory = Path(safe_directory_value).expanduser().resolve()
+        if safe_directory != certificate.parent and safe_directory not in certificate.parents:
+            raise RuntimeError("WORKBENCH_SSL_CERT must be located inside SAFE_CERT_DIR")
+    else:
+        os.environ["SAFE_CERT_DIR"] = str(certificate.parent)
+
+    return str(certificate)

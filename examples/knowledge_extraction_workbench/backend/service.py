@@ -13,6 +13,7 @@ from sqlmodel import select
 from .config import SecretBox, Settings
 from .errors import WorkbenchError
 from .models import (
+    AbilityProfile,
     AbilityMount,
     Asset,
     Exploration,
@@ -31,27 +32,29 @@ from .models import (
 from .model_runtime import OpenJiuwenKnowledgeModel
 from .pipeline import (
     ChunkRef,
-    FakeKnowledgeModel,
     chunk_material,
     chunk_refs_to_json,
+    chunk_text_sha256,
     fair_select_chunks,
     generate_assets,
+    normalize_chunk_text,
     render_markdown,
 )
 from .store import Store
 
 TERMINAL_JOB_STATUSES = {"COMPLETED", "FAILED"}
 REQUIRED_ASSET_KINDS = {"RULES_XLSX", "THOUGHT_CHAIN_MD", "SKILL_ZIP", "QA_JSONL", "EVAL_JSONL"}
+SUGGESTION_MODES = {"CONSISTENCY", "REGULATORY", "GAP", "CUSTOM"}
 
 
 class WorkbenchService:
     """Coordinates persistent state and deterministic local generation."""
 
-    def __init__(self, settings: Settings, store: Store, secret_box: SecretBox):
+    def __init__(self, settings: Settings, store: Store, secret_box: SecretBox, test_model: Any | None = None):
         self.settings = settings
         self.store = store
         self.secret_box = secret_box
-        self.model = FakeKnowledgeModel()
+        self._test_model = test_model
         self._tasks: dict[str, asyncio.Task[None]] = {}
 
     async def close(self) -> None:
@@ -61,37 +64,58 @@ class WorkbenchService:
         if active:
             await asyncio.gather(*active, return_exceptions=True)
 
-    def _freeze_ability_mounts(self) -> list[dict[str, Any]]:
+    def _freeze_ability_mounts(self, scope_key: str = "GLOBAL") -> list[dict[str, Any]]:
         with self.store.session() as session:
-            mounts = session.exec(select(AbilityMount).where(AbilityMount.enabled == True)).all()  # noqa: E712
+            mounts = session.exec(select(AbilityMount)).all()
+            profiles = {
+                item.mount_id: item
+                for item in session.exec(select(AbilityProfile).where(AbilityProfile.scope_key == scope_key)).all()
+            }
             frozen_mounts = []
             for mount in mounts:
-                model = session.get(ModelConnection, mount.model_connection_id) if mount.model_connection_id else None
-                skill = session.get(SkillVersion, mount.skill_version_id) if mount.skill_version_id else None
+                profile = profiles.get(mount.id)
+                enabled = profile.enabled if profile else mount.enabled
+                if not enabled:
+                    continue
+                model_id = profile.model_connection_id if profile else mount.model_connection_id
+                skill_id = profile.skill_version_id if profile else mount.skill_version_id
+                params_json = profile.params_json if profile else mount.params_json
+                model = session.get(ModelConnection, model_id) if model_id else None
+                skill = session.get(SkillVersion, skill_id) if skill_id else None
                 frozen_mounts.append(
                     {
                         "ability_key": mount.ability_key,
+                        "scope_key": scope_key,
                         "model": {
                             "id": model.id,
                             "provider": model.provider,
                             "api_base": model.api_base,
                             "model_name": model.model_name,
+                            "enabled": model.enabled,
                             "credential_ciphertext": model.encrypted_api_key,
                             "updated_at": model.updated_at.isoformat(),
                         }
                         if model
                         else None,
                         "skill": {"id": skill.id, "name": skill.name, "version": skill.version} if skill else None,
-                        "params": json.loads(mount.params_json or "{}"),
+                        "params": json.loads(params_json or "{}"),
                     }
                 )
         return frozen_mounts
 
-    def freeze_config(self, materials: list[Material], selected: list[ChunkRef]) -> dict[str, Any]:
+    def freeze_config(
+        self,
+        materials: list[Material],
+        selected: list[ChunkRef],
+        *,
+        scope_key: str = "GLOBAL",
+        ability_mounts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
         return {
             "template_version": "knowledge-workbench/v1",
-            "model_runtime": self.model.model_id,
-            "ability_mounts": self._freeze_ability_mounts(),
+            "model_runtime": "ability-mounts",
+            "ability_scope": scope_key,
+            "ability_mounts": ability_mounts or self._freeze_ability_mounts(scope_key),
             "materials": [
                 {"id": item.id, "name": item.name, "sha256": item.sha256, "role": item.role}
                 for item in materials
@@ -106,8 +130,18 @@ class WorkbenchService:
             None,
         )
         model = mount.get("model") if mount else None
-        if not model or model.get("provider") == "FakeModel":
-            return self.model
+        if not model:
+            if self._test_model is not None:
+                return self._test_model
+            raise WorkbenchError(
+                "MODEL_MOUNT_REQUIRED",
+                f"能力 {ability_key} 尚未挂载可用模型，请先在智能体配置中选择一个已启用的模型连接。",
+                status=422,
+            )
+        if model.get("provider") == "FakeModel":
+            raise WorkbenchError("MODEL_PROVIDER_UNSUPPORTED", "产品运行不再支持 Fake Model。", status=422)
+        if not model.get("enabled", True):
+            raise WorkbenchError("MODEL_DISABLED", f"能力 {ability_key} 挂载的模型已停用。", status=422)
         encrypted_key = str(model.get("credential_ciphertext", ""))
         if not encrypted_key:
             raise WorkbenchError(
@@ -123,6 +157,14 @@ class WorkbenchService:
             api_key=self.secret_box.decrypt(encrypted_key),
             temperature=float(params.get("temperature", 0.2)),
         )
+
+    @staticmethod
+    def _mount_params(snapshot: dict[str, Any], ability_key: str) -> dict[str, Any]:
+        mount = next(
+            (item for item in snapshot.get("ability_mounts", []) if item.get("ability_key") == ability_key),
+            None,
+        )
+        return mount.get("params", {}) if isinstance(mount, dict) and isinstance(mount.get("params"), dict) else {}
 
     def create_scene(self, payload: dict[str, Any]) -> tuple[Scene, ExtractionRound]:
         name = str(payload.get("name", "")).strip()
@@ -300,11 +342,14 @@ class WorkbenchService:
                 session.expunge(item)
         if not materials:
             raise WorkbenchError("MATERIAL_REQUIRED", "请先上传至少一份素材。", status=422)
-        selected = fair_select_chunks(self._load_material_chunks(materials))
+        ability_mounts = self._freeze_ability_mounts()
+        mount_snapshot = {"ability_mounts": ability_mounts}
+        max_chunks = max(4, min(60, int(self._mount_params(mount_snapshot, "KNOWLEDGE_EXTRACTOR").get("max_chunks", 24))))
+        selected = fair_select_chunks(self._load_material_chunks(materials), max_total=max_chunks)
         job = self._new_job(
             kind="EXPLORATION",
             exploration_id=exploration_id,
-            frozen_config=self.freeze_config(materials, selected),
+            frozen_config=self.freeze_config(materials, selected, ability_mounts=ability_mounts),
         )
         self._spawn(job)
         return job
@@ -335,7 +380,11 @@ class WorkbenchService:
             for item in materials:
                 session.expunge(item)
             scene_id = round_row.scene_id
-        selected = fair_select_chunks(self._load_material_chunks(materials))
+        scope_key = f"SCENE:{scene_id}"
+        ability_mounts = self._freeze_ability_mounts(scope_key)
+        mount_snapshot = {"ability_mounts": ability_mounts}
+        max_chunks = max(4, min(60, int(self._mount_params(mount_snapshot, "KNOWLEDGE_EXTRACTOR").get("max_chunks", 24))))
+        selected = fair_select_chunks(self._load_material_chunks(materials), max_total=max_chunks)
         with self.store.session() as session:
             round_row = session.get(ExtractionRound, round_id)
             if round_row is None:
@@ -353,7 +402,12 @@ class WorkbenchService:
             kind="EXTRACTION",
             scene_id=scene_id,
             round_id=round_id,
-            frozen_config=self.freeze_config(materials, selected),
+            frozen_config=self.freeze_config(
+                materials,
+                selected,
+                scope_key=scope_key,
+                ability_mounts=ability_mounts,
+            ),
         )
         self._spawn(job)
         return job
@@ -375,8 +429,9 @@ class WorkbenchService:
                 raise WorkbenchError("ROUND_JOB_CONFLICT", "当前轮次已有任务运行中。", status=409)
             snapshot = {
                 "template_version": "knowledge-assets/v1",
-                "model_runtime": self.model.model_id,
-                "ability_mounts": self._freeze_ability_mounts(),
+                "model_runtime": "ability-mounts",
+                "ability_scope": f"SCENE:{round_row.scene_id}",
+                "ability_mounts": self._freeze_ability_mounts(f"SCENE:{round_row.scene_id}"),
                 "document_revision": document.revision,
                 "document_sha256": hashlib.sha256(document.markdown.encode()).hexdigest(),
                 "only_kind": only_kind,
@@ -456,8 +511,8 @@ class WorkbenchService:
             index = reference["chunk_index"]
             if index >= len(chunks):
                 raise WorkbenchError("MATERIAL_CHUNK_CHANGED", "素材分块结果与任务快照不一致。", status=409)
-            text = chunks[index]
-            if hashlib.sha256(text.encode()).hexdigest() != reference["text_sha256"]:
+            text = normalize_chunk_text(chunks[index])
+            if chunk_text_sha256(text) != reference["text_sha256"]:
                 raise WorkbenchError("MATERIAL_CHUNK_CHANGED", "素材片段与任务快照不一致。", status=409)
             selected.append(
                 ChunkRef(
@@ -476,7 +531,7 @@ class WorkbenchService:
         )
         snapshot = json.loads(job.frozen_config_json)
         selected = self._selected_chunks_from_snapshot(snapshot)
-        runtime = self._runtime_for(snapshot, "SCENE_EXPLORER")
+        runtime = self._runtime_for(snapshot, "KNOWLEDGE_EXTRACTOR")
         self.store.record_job_event(
             job.id, phase="analyzing", status="RUNNING", progress=54, message="正在识别业务目标、规则和场景边界"
         )
@@ -515,7 +570,7 @@ class WorkbenchService:
             job.id, phase="selecting", status="RUNNING", progress=10, message="正在校验素材哈希与片段快照"
         )
         selected = self._selected_chunks_from_snapshot(snapshot)
-        runtime = self._runtime_for(snapshot, "RULE_EXTRACTOR")
+        runtime = self._runtime_for(snapshot, "KNOWLEDGE_EXTRACTOR")
         with self.store.session() as session:
             round_row = session.get(ExtractionRound, job.round_id)
             scene = session.get(Scene, round_row.scene_id) if round_row else None
@@ -525,7 +580,8 @@ class WorkbenchService:
         self.store.record_job_event(
             job.id, phase="mapping", status="RUNNING", progress=28, message=f"正在分块萃取 {len(selected)} 个证据片段"
         )
-        semaphore = asyncio.Semaphore(3)
+        concurrency = max(1, min(6, int(self._mount_params(snapshot, "KNOWLEDGE_EXTRACTOR").get("concurrency", 3))))
+        semaphore = asyncio.Semaphore(concurrency)
 
         async def _map(sequence: int, chunk: ChunkRef) -> dict[str, Any]:
             async with semaphore:
@@ -588,7 +644,8 @@ class WorkbenchService:
             job.id, phase="preparing", status="RUNNING", progress=12, message="正在校验文档修订与资产模板"
         )
         snapshot = json.loads(job.frozen_config_json)
-        runtime = self._runtime_for(snapshot, "EVALUATOR")
+        qa_runtime = self._runtime_for(snapshot, "QA_GENERATOR")
+        evaluation_runtime = self._runtime_for(snapshot, "EVALUATION_GENERATOR")
         with self.store.session() as session:
             round_row = session.get(ExtractionRound, job.round_id)
             document = session.exec(select(KnowledgeDocument).where(KnowledgeDocument.round_id == job.round_id)).first()
@@ -604,7 +661,14 @@ class WorkbenchService:
             job.id, phase="generating", status="RUNNING", progress=48, message="正在生成规则、Skill、QA 与评测资产"
         )
         output_dir = self.settings.asset_dir / str(job.round_id) / f"job-{job.id}"
-        specs = await generate_assets(output_dir, scene_name, markdown, structured, runtime)
+        specs = await generate_assets(
+            output_dir,
+            scene_name,
+            markdown,
+            structured,
+            qa_runtime,
+            evaluation_runtime,
+        )
         only_kind = snapshot.get("only_kind")
         if only_kind:
             specs = [spec for spec in specs if spec.kind == only_kind]
@@ -693,7 +757,21 @@ class WorkbenchService:
             session.expunge(round_row)
             return round_row
 
-    async def create_suggestion(self, round_id: str) -> Suggestion:
+    async def create_suggestion(
+        self,
+        round_id: str,
+        *,
+        mode: str = "CONSISTENCY",
+        instruction: str = "",
+    ) -> Suggestion:
+        normalized_mode = mode.strip().upper()
+        normalized_instruction = instruction.strip()
+        if normalized_mode not in SUGGESTION_MODES:
+            raise WorkbenchError("SUGGESTION_MODE_INVALID", "不支持该 AI 检查模式。", status=422)
+        if normalized_mode == "CUSTOM" and not normalized_instruction:
+            raise WorkbenchError("SUGGESTION_INSTRUCTION_REQUIRED", "请输入希望 AI 如何修改文档。", status=422)
+        if len(normalized_instruction) > 1000:
+            raise WorkbenchError("SUGGESTION_INSTRUCTION_TOO_LONG", "修改指令不能超过 1000 个字符。", status=422)
         with self.store.session() as session:
             round_row = session.get(ExtractionRound, round_id)
             if round_row is None:
@@ -706,9 +784,18 @@ class WorkbenchService:
             markdown = document.markdown
             structured = json.loads(document.structured_json)
             revision = document.revision
-        snapshot = {"ability_mounts": self._freeze_ability_mounts()}
+        snapshot = {
+            "ability_scope": f"SCENE:{round_row.scene_id}",
+            "ability_mounts": self._freeze_ability_mounts(f"SCENE:{round_row.scene_id}"),
+        }
         runtime = self._runtime_for(snapshot, "ALIGNMENT_REVIEWER")
-        suggestion_data = await runtime.suggest(markdown, structured, revision)
+        suggestion_data = await runtime.suggest(
+            markdown,
+            structured,
+            revision,
+            mode=normalized_mode,
+            instruction=normalized_instruction,
+        )
         suggestion = Suggestion(
             round_id=round_id,
             base_revision=revision,

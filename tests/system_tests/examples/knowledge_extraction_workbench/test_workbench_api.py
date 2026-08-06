@@ -1,19 +1,24 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import sys
+import zipfile
 from pathlib import Path
 
 import pytest
 from aiohttp import FormData
 from aiohttp.test_utils import TestClient, TestServer
+from sqlmodel import select
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "examples"))
 
 from knowledge_extraction_workbench.backend.app import APP_STORE, create_app
 from knowledge_extraction_workbench.backend.config import Settings
+from knowledge_extraction_workbench.backend.errors import WorkbenchError
 from knowledge_extraction_workbench.backend.models import Job
+from knowledge_extraction_workbench.backend.pipeline import DeterministicTestModel
 
 
 def make_settings(root: Path) -> Settings:
@@ -39,9 +44,13 @@ async def wait_for_job(client: TestClient, job_id: str) -> dict:
     raise AssertionError(f"job {job_id} did not finish")
 
 
+def create_test_app(root: Path):
+    return create_app(make_settings(root), test_model=DeterministicTestModel())
+
+
 @pytest.mark.asyncio
-async def test_complete_fake_model_workflow_and_immutable_publish(tmp_path):
-    app = create_app(make_settings(tmp_path))
+async def test_complete_injected_model_workflow_and_immutable_publish(tmp_path):
+    app = create_test_app(tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
@@ -58,6 +67,13 @@ async def test_complete_fake_model_workflow_and_immutable_publish(tmp_path):
         created = await create_response.json()
         scene_id = created["scene"]["id"]
         round_id = created["round"]["id"]
+
+        update_response = await client.patch(
+            f"/api/v1/scenes/{scene_id}",
+            json={"name": "差旅费用审核（已确认）", "subscenes": ["申请前审核", "报销复核"]},
+        )
+        assert update_response.status == 200, await update_response.text()
+        assert (await update_response.json())["name"] == "差旅费用审核（已确认）"
 
         material_text = "\n".join(
             [
@@ -91,9 +107,20 @@ async def test_complete_fake_model_workflow_and_immutable_publish(tmp_path):
         assert document["structured"]["rules"]
         assert "travel-policy.txt" in document["markdown"]
 
-        suggestion_response = await client.post(f"/api/v1/rounds/{round_id}/suggestions")
+        missing_instruction_response = await client.post(
+            f"/api/v1/rounds/{round_id}/suggestions",
+            json={"mode": "CUSTOM", "instruction": ""},
+        )
+        assert missing_instruction_response.status == 422
+        assert (await missing_instruction_response.json())["code"] == "SUGGESTION_INSTRUCTION_REQUIRED"
+
+        suggestion_response = await client.post(
+            f"/api/v1/rounds/{round_id}/suggestions",
+            json={"mode": "CUSTOM", "instruction": "补充复核留痕与异常升级条件"},
+        )
         assert suggestion_response.status == 201
         suggestion = await suggestion_response.json()
+        assert "按意图改写" in suggestion["explanation"]
         apply_response = await client.post(
             f"/api/v1/suggestions/{suggestion['id']}/apply",
             json={"base_revision": document["revision"]},
@@ -163,7 +190,7 @@ async def test_complete_fake_model_workflow_and_immutable_publish(tmp_path):
 
 @pytest.mark.asyncio
 async def test_archive_conflict_and_model_secret_never_returns(tmp_path):
-    app = create_app(make_settings(tmp_path))
+    app = create_test_app(tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
@@ -197,13 +224,189 @@ async def test_archive_conflict_and_model_secret_never_returns(tmp_path):
 
         listed = await (await client.get("/api/v1/models")).json()
         assert "secret-value-must-not-return" not in json.dumps(listed)
+
+        with store.session() as session:
+            running = session.exec(select(Job).where(Job.scene_id == scene_id)).first()
+            assert running is not None
+            running_id = running.id
+        store.fail_job(
+            running_id,
+            WorkbenchError("MODEL_JSON_INVALID", "模型输出无效。", status=422, retryable=True),
+        )
+        failed = store.get(Job, running_id)
+        assert failed.status == "FAILED"
+        assert failed.phase == "failed"
+        assert failed.error_code == "MODEL_JSON_INVALID"
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_model_connection_test_passes_strict_tls_config(tmp_path, monkeypatch):
+    captured = {}
+
+    class StubModel:
+        def __init__(self, client_config, request_config):
+            captured["client_config"] = client_config
+            captured["request_config"] = request_config
+
+        async def invoke(self, *args, **kwargs):
+            return None
+
+    monkeypatch.setattr("openjiuwen.core.foundation.llm.Model", StubModel)
+    app = create_test_app(tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        created = await client.post(
+            "/api/v1/models",
+            json={
+                "name": "测试 DeepSeek",
+                "provider": "DeepSeek",
+                "api_base": "https://api.deepseek.com/v1",
+                "model_name": "deepseek-v4-flash",
+                "api_key": "test-key",
+            },
+        )
+        model = await created.json()
+
+        tested = await client.post(f"/api/v1/models/{model['id']}/test")
+
+        assert tested.status == 200, await tested.text()
+        assert captured["client_config"].verify_ssl is True
+        assert Path(captured["client_config"].ssl_cert).is_file()
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_real_model_ability_scopes_and_skill_instance_versions(tmp_path):
+    app = create_test_app(tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        models = await (await client.get("/api/v1/models")).json()
+        assert models["items"] == []
+
+        skills = await (await client.get("/api/v1/skills")).json()
+        templates = skills["items"]
+        assert len(templates) == 6
+        assert {item["kind"] for item in templates} == {"TEMPLATE"}
+        assert all(item["read_only"] for item in templates)
+
+        deepseek_response = await client.post(
+            "/api/v1/models",
+            json={
+                "name": "DeepSeek",
+                "provider": "DeepSeek",
+                "api_base": "https://api.deepseek.com/v1",
+                "model_name": "deepseek-chat",
+                "api_key": "test-key",
+            },
+        )
+        deepseek_model = await deepseek_response.json()
+        openai_response = await client.post(
+            "/api/v1/models",
+            json={
+                "name": "OpenAI 兼容连接",
+                "provider": "OpenAI",
+                "api_base": "https://api.openai.com/v1",
+                "model_name": "gpt-4.1-mini",
+                "api_key": "another-test-key",
+            },
+        )
+        openai_model = await openai_response.json()
+
+        ambiguous_reset = await client.post("/api/v1/ability-mounts/defaults")
+        assert ambiguous_reset.status == 422
+        assert (await ambiguous_reset.json())["code"] == "MODEL_SELECTION_REQUIRED"
+
+        reset = await client.post(
+            "/api/v1/ability-mounts/defaults",
+            json={"model_connection_id": openai_model["id"]},
+        )
+        assert reset.status == 200, await reset.text()
+        mounts = (await (await client.get("/api/v1/ability-mounts")).json())["items"]
+        assert len(mounts) == 7
+        assert sum(item["stage"] == "EXTRACTION" for item in mounts) == 2
+        assert sum(item["stage"] == "GENERATION" for item in mounts) == 5
+        assert {item["model_connection_id"] for item in mounts} == {openai_model["id"]}
+        assert {item["model"]["provider"] for item in mounts} == {"OpenAI"}
+        assert deepseek_model["id"] != openai_model["id"]
+
+        created = await (
+            await client.post(
+                "/api/v1/scenes",
+                json={"name": "差旅审核", "subscenes": ["报销复核"]},
+            )
+        ).json()
+        scene_scope = f"SCENE:{created['scene']['id']}"
+        scopes = (await (await client.get("/api/v1/ability-scopes")).json())["items"]
+        assert {item["kind"] for item in scopes} == {"GLOBAL", "SCENE", "SUBSCENE"}
+        scoped_mounts = (
+            await (
+                await client.get("/api/v1/ability-mounts", params={"scope_key": scene_scope})
+            ).json()
+        )["items"]
+        assert all(item["inherited"] for item in scoped_mounts)
+        override = await client.put(
+            f"/api/v1/ability-mounts/{scoped_mounts[0]['id']}",
+            json={"scope_key": scene_scope, "enabled": False},
+        )
+        assert override.status == 200
+        assert (await override.json())["inherited"] is False
+
+        instance_response = await client.post(
+            "/api/v1/skills/instances",
+            json={
+                "template_id": templates[0]["id"],
+                "name": "差旅规则萃取",
+                "scene_name": "差旅审核",
+                "notes": "首版",
+            },
+        )
+        assert instance_response.status == 201, await instance_response.text()
+        instance = await instance_response.json()
+        assert instance["kind"] == "INSTANCE"
+        assert instance["source_skill_id"] == templates[0]["id"]
+
+        download = await client.get(instance["download_url"])
+        assert download.status == 200
+        with zipfile.ZipFile(io.BytesIO(await download.read())) as archive:
+            assert {"SKILL.md", "scripts/validate.py"}.issubset(archive.namelist())
+
+        package = io.BytesIO()
+        with zipfile.ZipFile(package, "w") as archive:
+            archive.writestr(
+                "SKILL.md",
+                "---\nname: travel-rule-extraction\ndescription: Travel rule extraction.\n---\n",
+            )
+            archive.writestr("references/README.md", "reviewed sources")
+        version_form = FormData()
+        version_form.add_field(
+            "file",
+            package.getvalue(),
+            filename="travel-skill.zip",
+            content_type="application/zip",
+        )
+        version_response = await client.post(
+            f"/api/v1/skills/{instance['id']}/versions",
+            data=version_form,
+        )
+        assert version_response.status == 201, await version_response.text()
+        next_version = await version_response.json()
+        assert next_version["version"] == "0.2.0"
+        versions = await (
+            await client.get(f"/api/v1/skills/{next_version['id']}/versions")
+        ).json()
+        assert [item["version"] for item in versions["items"]] == ["0.2.0", "0.1.0"]
     finally:
         await client.close()
 
 
 @pytest.mark.asyncio
 async def test_exploration_upload_analyze_candidate_and_archive(tmp_path):
-    app = create_app(make_settings(tmp_path))
+    app = create_test_app(tmp_path)
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
