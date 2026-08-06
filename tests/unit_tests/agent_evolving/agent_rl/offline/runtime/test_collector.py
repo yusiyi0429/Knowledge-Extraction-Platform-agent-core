@@ -1,0 +1,249 @@
+# -*- coding: utf-8 -*-
+"""Unit tests for trajectory module: RLRail, TrajectoryCollector."""
+
+from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+
+from openjiuwen.agent_evolving.agent_rl.offline.runtime.collector import (
+    TrajectoryCollector,
+)
+from openjiuwen.agent_evolving.agent_rl.rl_rail import RLRail
+from openjiuwen.agent_evolving.agent_rl.schemas import trajectory_to_rollouts
+from openjiuwen.agent_evolving.trajectory import (
+    InMemoryTrajectoryStore,
+    trajectory_session_id,
+    trajectory_steps,
+)
+from openjiuwen.core.single_agent.rail.base import (
+    AgentCallbackContext,
+    InvokeInputs,
+    ModelCallInputs,
+)
+
+
+def _ctx(inputs) -> MagicMock:
+    ctx = MagicMock(spec=AgentCallbackContext)
+    ctx.inputs = inputs
+    ctx.agent = None
+    return ctx
+
+
+@pytest.mark.asyncio
+async def test_rl_rail_uses_evolution_rail_flow():
+    """Test RLRail works with EvolutionRail's base class flow."""
+    store = InMemoryTrajectoryStore()
+    rail = RLRail(session_id="test-session", case_id="case-123", trajectory_store=store)
+
+    invoke_inputs = InvokeInputs(query="hi", conversation_id="test-session")
+    await rail.before_invoke(_ctx(invoke_inputs))
+
+    before = ModelCallInputs(
+        messages=[{"role": "user", "content": "test query"}],
+        tools=[{"name": "test_tool", "description": "test tool"}],
+    )
+    await rail.before_model_call(_ctx(before))
+
+    mock_response = MagicMock()
+    mock_response.content = "test response"
+    mock_response.tool_calls = []
+    del mock_response.model_dump
+
+    after = ModelCallInputs(
+        messages=[{"role": "user", "content": "test query"}],
+        tools=[{"name": "test_tool", "description": "test tool"}],
+        response=mock_response,
+    )
+    await rail.after_model_call(_ctx(after))
+
+    await rail.after_invoke(_ctx(invoke_inputs))
+
+    trajectories = store.query()
+    assert len(trajectories) == 1
+    assert trajectory_session_id(trajectories[0]) == "test-session"
+    step0 = trajectory_steps(trajectories[0])[0]
+    assert step0.meta.get("turn_id") == 0
+    assert step0.meta.get("case_id") == "case-123"
+
+
+@pytest.mark.asyncio
+async def test_rl_rail_with_tool_calls():
+    """Test RLRail handles tool calls correctly."""
+    store = InMemoryTrajectoryStore()
+    rail = RLRail(trajectory_store=store)
+
+    invoke_inputs = InvokeInputs(query="q", conversation_id="test")
+    await rail.before_invoke(_ctx(invoke_inputs))
+
+    response_dict = {
+        "role": "assistant",
+        "content": "Thinking...",
+        "tool_calls": [
+            {
+                "id": "tc1",
+                "type": "function",
+                "function": {
+                    "name": "test_tool",
+                    "arguments": '{"param": "value"}',
+                },
+            }
+        ],
+    }
+
+    after = ModelCallInputs(
+        messages=[{"role": "user", "content": "test query"}],
+        response=response_dict,
+    )
+    await rail.after_model_call(_ctx(after))
+    await rail.after_invoke(_ctx(invoke_inputs))
+
+    trajectories = store.query()
+    assert len(trajectories) == 1
+    response = trajectory_steps(trajectories[0])[0].detail.response
+    assert response["tool_calls"][0]["function"]["name"] == "test_tool"
+
+
+@pytest.mark.asyncio
+async def test_rl_rail_lifts_token_fields_into_otlp_trajectory_rollouts():
+    """RLRail should persist token fields on the new trajectory projection."""
+    store = InMemoryTrajectoryStore()
+    rail = RLRail(trajectory_store=store)
+
+    invoke_inputs = InvokeInputs(query="q", conversation_id="test")
+    await rail.before_invoke(_ctx(invoke_inputs))
+
+    response = {
+        "role": "assistant",
+        "content": "answer",
+        "prompt_token_ids": [11, 12],
+        "completion_token_ids": [21, 22, 23],
+        "logprobs": [-0.1, -0.2, -0.3],
+    }
+    await rail.after_model_call(_ctx(ModelCallInputs(
+        messages=[{"role": "user", "content": "q"}],
+        response=response,
+    )))
+    await rail.after_invoke(_ctx(invoke_inputs))
+
+    trajectories = store.query()
+    assert len(trajectories) == 1
+    step = trajectory_steps(trajectories[0])[0]
+    assert step.prompt_token_ids == [11, 12]
+    assert step.completion_token_ids == [21, 22, 23]
+    assert step.logprobs == [-0.1, -0.2, -0.3]
+    assert step.detail.response == {"role": "assistant", "content": "answer"}
+
+    rollout = trajectory_to_rollouts(trajectories[0])[0]
+    assert rollout.input_prompt_ids == [11, 12]
+    assert rollout.output_response_ids == [21, 22, 23]
+
+
+@pytest.mark.asyncio
+async def test_rl_rail_keeps_one_invoke_per_trajectory():
+    """RLRail must not inherit cross-invoke accumulation from EvolutionRail."""
+    store = InMemoryTrajectoryStore()
+    rail = RLRail(trajectory_store=store)
+
+    first_invoke = InvokeInputs(query="q1", conversation_id="same-session")
+    await rail.before_invoke(_ctx(first_invoke))
+    await rail.after_model_call(_ctx(ModelCallInputs(
+        messages=[{"role": "user", "content": "q1"}],
+        response={"role": "assistant", "content": "a1"},
+    )))
+    await rail.after_invoke(_ctx(first_invoke))
+
+    second_invoke = InvokeInputs(query="q2", conversation_id="same-session")
+    await rail.before_invoke(_ctx(second_invoke))
+    await rail.after_model_call(_ctx(ModelCallInputs(
+        messages=[{"role": "user", "content": "q2"}],
+        response={"role": "assistant", "content": "a2"},
+    )))
+    await rail.after_invoke(_ctx(second_invoke))
+
+    trajectories = store.query()
+    assert len(trajectories) == 2
+    assert [len(trajectory_steps(trajectory)) for trajectory in trajectories] == [1, 1]
+    assert trajectory_steps(trajectories[1])[0].detail.messages[0]["content"] == "q2"
+
+
+@pytest.mark.asyncio
+async def test_rl_rail_keeps_full_single_invoke_trajectory():
+    """RLRail must not inherit EvolutionRail's default step window."""
+    store = InMemoryTrajectoryStore()
+    rail = RLRail(trajectory_store=store)
+
+    invoke = InvokeInputs(query="q", conversation_id="same-session")
+    await rail.before_invoke(_ctx(invoke))
+    for index in range(201):
+        await rail.after_model_call(_ctx(ModelCallInputs(
+            messages=[{"role": "user", "content": f"q{index}"}],
+            response={"role": "assistant", "content": f"a{index}"},
+        )))
+    await rail.after_invoke(_ctx(invoke))
+
+    trajectories = store.query()
+    assert len(trajectories) == 1
+    assert len(trajectory_steps(trajectories[0])) == 201
+    assert trajectory_steps(trajectories[0])[0].detail.messages[0]["content"] == "q0"
+
+
+@pytest.mark.asyncio
+async def test_trajectory_collector_basic():
+    """Test TrajectoryCollector registers rail; mock invoke does not emit after_invoke."""
+    mock_agent = MagicMock()
+    mock_agent.register_rail = AsyncMock()
+    mock_agent.unregister_rail = AsyncMock()
+    mock_agent.invoke = AsyncMock()
+
+    collector = TrajectoryCollector()
+    result = await collector.collect(mock_agent, {"query": "test"})
+
+    assert result is None
+    mock_agent.register_rail.assert_called_once()
+    mock_agent.invoke.assert_called_once()
+
+
+@pytest.mark.asyncio
+async def test_trajectory_collector_raises_for_unsupported_agent():
+    """Test TrajectoryCollector rejects agents without register_rail."""
+    class PlainAgent:
+        pass
+
+    collector = TrajectoryCollector()
+    with pytest.raises(ValueError, match="register_rail"):
+        await collector.collect(PlainAgent(), {"query": "test"})
+
+
+@pytest.mark.asyncio
+async def test_trajectory_collector_partial_on_exception():
+    """Test TrajectoryCollector returns trajectory when mock simulates full rail flow."""
+    rail_holder = {}
+
+    async def mock_register_rail(rail):
+        rail_holder["rail"] = rail
+
+    async def mock_invoke(inputs, session=None):
+        rail = rail_holder["rail"]
+        invoke_inputs = InvokeInputs(query="test", conversation_id="test")
+        await rail.before_invoke(_ctx(invoke_inputs))
+
+        after = ModelCallInputs(
+            messages=[{"role": "user", "content": "q"}],
+            response=MagicMock(content="partial", tool_calls=[]),
+        )
+        del after.response.model_dump
+        await rail.after_model_call(_ctx(after))
+        await rail.after_invoke(_ctx(invoke_inputs))
+
+        raise RuntimeError("something went wrong")
+
+    mock_agent = MagicMock()
+    mock_agent.register_rail = mock_register_rail
+    mock_agent.unregister_rail = AsyncMock()
+    mock_agent.invoke = mock_invoke
+
+    collector = TrajectoryCollector()
+    result = await collector.collect(mock_agent, {"query": "test"})
+
+    assert result is not None
+    assert len(trajectory_steps(result)) == 1

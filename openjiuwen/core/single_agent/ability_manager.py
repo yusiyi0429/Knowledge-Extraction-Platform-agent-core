@@ -1,0 +1,1033 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
+"""AbilityManager Class Definition
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+from dataclasses import dataclass
+from typing import List, Any, Union, Optional, Tuple, Dict
+from pydantic import BaseModel
+
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import AgentError
+from openjiuwen.core.common.logging import logger
+from openjiuwen.core.foundation.llm import ToolMessage, ToolCall
+from openjiuwen.core.foundation.tool import ToolInfo
+from openjiuwen.core.foundation.tool import Tool
+from openjiuwen.core.foundation.tool import ToolCard
+from openjiuwen.core.foundation.tool import McpServerConfig
+from openjiuwen.core.session.agent import Session
+from openjiuwen.core.single_agent.rail.base import (
+    AgentCallbackContext,
+    AgentCallbackEvent,
+    ToolCallInputs,
+    rail,
+)
+from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+from openjiuwen.core.workflow import WorkflowCard
+from openjiuwen.core.single_agent.interrupt.exception import ToolInterruptException
+from openjiuwen.core.session.agent import create_agent_session
+from openjiuwen.core.single_agent.interrupt.state import INTERRUPT_AUTO_CONFIRM_KEY
+
+# Ability type definition
+Ability = Union[ToolCard, WorkflowCard, AgentCard, McpServerConfig]
+
+
+@dataclass
+class AddAbilityResult:
+    """Ability add result."""
+    name: str
+    added: bool
+    reason: str = ""
+
+
+class AbilityExecutionError(AgentError):
+    """Unified exception for ability execution failures."""
+
+    def __init__(
+            self,
+            status: StatusCode,
+            *,
+            msg: Optional[str] = None,
+            details: Optional[Any] = None,
+            cause: Optional[BaseException] = None,
+            tool_message: Optional[ToolMessage] = None,
+            **kwargs: Any,
+    ):
+        super().__init__(
+            status=status,
+            msg=msg,
+            details=details,
+            cause=cause,
+            **kwargs,
+        )
+        self.tool_message = tool_message
+
+
+class AbilityManager:
+    """Agent Ability Manager
+
+    Responsibilities:
+    - Store available ability Cards for Agent (metadata only, no instances)
+    - Provide add/remove/query interfaces for abilities
+    - Convert Cards to ToolInfo for LLM usage
+    - Execute ability calls (get instances from ResourceManager)
+    """
+
+    def __init__(self, owner_id: Optional[str] = None):
+        self._tools: Dict[str, ToolCard] = {}
+        self._workflows: Dict[str, WorkflowCard] = {}
+        self._agents: Dict[str, AgentCard] = {}
+        self._mcp_servers: Dict[str, McpServerConfig] = {}
+        self._context_engine = None
+        # Owner agent id used to qualify stateful tool ids on registration so
+        # each agent owns an exclusive resource-manager entry.
+        self._owner_id: Optional[str] = owner_id
+
+    def set_owner_id(self, owner_id: Optional[str]) -> None:
+        """Set the owner agent id used to qualify stateful tool ids."""
+        self._owner_id = owner_id
+
+    @staticmethod
+    def _build_tool_message_content(result: Any) -> str:
+        data = getattr(result, "data", None)
+        error = getattr(result, "error", None)
+        success = getattr(result, "success", None)
+
+        if success is False and error:
+            return str(error)
+
+        if isinstance(data, dict) and "content" in data:
+            content = str(data.get("content") or "")
+            if content:
+                return content
+            if success is True:
+                path = data.get("path")
+                suffix = f" path={path}" if path else ""
+                return f"Tool succeeded but returned empty content.{suffix}"
+            return ""
+
+        return str(result)
+
+    def set_context_engine(self, context_engine) -> None:
+        self._context_engine = context_engine
+
+    @staticmethod
+    def _normalize_tool_calls(
+            tool_call: Union[ToolCall, List[ToolCall]],
+    ) -> List[ToolCall]:
+        tool_calls: List[ToolCall] = []
+        if isinstance(tool_call, list):
+            tool_calls.extend(tool_call)
+        elif isinstance(tool_call, ToolCall):
+            tool_calls.append(tool_call)
+        else:
+            logger.warning(
+                f"execute ability input tool call is invalid, {type(tool_call)}!"
+            )
+        return tool_calls
+
+    @staticmethod
+    def _repair_tool_arguments_json(arguments: str) -> Optional[str]:
+        text = arguments.strip()
+        if not text:
+            return None
+
+        stack: List[str] = []
+        in_string = False
+        escape = False
+        for char in text:
+            if in_string:
+                if escape:
+                    escape = False
+                elif char == "\\":
+                    escape = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+                continue
+            if char in "{[":
+                stack.append(char)
+                continue
+            if char == "}":
+                if not stack or stack[-1] != "{":
+                    return None
+                stack.pop()
+                continue
+            if char == "]":
+                if not stack or stack[-1] != "[":
+                    return None
+                stack.pop()
+
+        if in_string:
+            return None
+        if not stack:
+            return text
+
+        suffix = "".join("}" if opener == "{" else "]" for opener in reversed(stack))
+        return f"{text}{suffix}"
+
+    @classmethod
+    def _parse_tool_arguments(cls, arguments: Any) -> Any:
+        """Parse tool-call arguments into a dict.
+
+        Raises ValueError with the JSON diagnostic and raw text when the
+        model emits invalid JSON (e.g. unquoted bareword values). The caller
+        surfaces this message back to the LLM so it can self-correct instead
+        of silently receiving an empty argument dict.
+        """
+        parsed, _ = cls._parse_tool_arguments_with_repair(arguments)
+        return parsed
+
+    @classmethod
+    def _parse_tool_arguments_with_repair(cls, arguments: Any) -> Tuple[Any, Optional[str]]:
+        """Parse tool-call arguments and return any repaired JSON string."""
+        if not isinstance(arguments, str):
+            return arguments, None
+        try:
+            return json.loads(arguments), None
+        except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+            repaired = cls._repair_tool_arguments_json(arguments)
+            if repaired and repaired != arguments:
+                try:
+                    logger.warning("Recovered malformed tool arguments by balancing closing brackets")
+                    return json.loads(repaired), repaired
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            raise ValueError(
+                f"Invalid tool arguments JSON: {exc}. Raw arguments: {arguments!r}"
+            ) from exc
+
+    @staticmethod
+    def _build_execution_error(
+            tool_call: ToolCall,
+            message: str,
+    ) -> AbilityExecutionError:
+        return AbilityExecutionError(
+            status=StatusCode.AGENT_TOOL_EXECUTION_ERROR,
+            msg=message,
+            error_msg=message,
+            tool_message=ToolMessage(
+                content=message,
+                tool_call_id=tool_call.id,
+            ),
+        )
+
+    @staticmethod
+    def _get_stream_writer_manager(session: Session) -> Any:
+        try:
+            return session._inner.stream_writer_manager()  # pylint: disable=protected-access
+        except AttributeError:
+            return None
+
+    def add(
+            self,
+            ability: Union[Ability, List[Ability]]
+    ) -> Union[AddAbilityResult, List[AddAbilityResult]]:
+        """Add an ability
+
+        Args:
+            ability: Ability Card to add
+
+        Returns:
+            AddAbilityResult for single ability input,
+            or List[AddAbilityResult] for list input
+        """
+
+        def add_single_ability(_ability: Ability) -> AddAbilityResult:
+            if isinstance(_ability, ToolCard):
+                existing = self._tools.get(_ability.name)
+                if existing is not None:
+                    logger.warning(
+                        f"Duplicate tool ability detected: "
+                        f"name='{_ability.name}', "
+                        f"existing_id='{existing.id}', "
+                        f"new_id='{_ability.id}'. "
+                        f"Keep existing ability and skip new one."
+                    )
+                    return AddAbilityResult(
+                        name=_ability.name,
+                        added=False,
+                        reason="duplicate_tool",
+                    )
+                self._tools[_ability.name] = _ability
+                return AddAbilityResult(
+                    name=_ability.name,
+                    added=True,
+                    reason="added_tool",
+                )
+
+            elif isinstance(_ability, WorkflowCard):
+                existing = self._workflows.get(_ability.name)
+                if existing is not None:
+                    logger.warning(
+                        f"Duplicate workflow ability detected: "
+                        f"name='{_ability.name}', "
+                        f"existing_id='{existing.id}', "
+                        f"new_id='{_ability.id}'. "
+                        f"Keep existing ability and skip new one."
+                    )
+                    return AddAbilityResult(
+                        name=_ability.name,
+                        added=False,
+                        reason="duplicate_workflow",
+                    )
+                self._workflows[_ability.name] = _ability
+                return AddAbilityResult(
+                    name=_ability.name,
+                    added=True,
+                    reason="added_workflow",
+                )
+
+            elif isinstance(_ability, AgentCard):
+                existing = self._agents.get(_ability.name)
+                if existing is not None:
+                    logger.warning(
+                        f"Duplicate agent ability detected: "
+                        f"name='{_ability.name}', "
+                        f"existing_id='{existing.id}', "
+                        f"new_id='{_ability.id}'. "
+                        f"Keep existing ability and skip new one."
+                    )
+                    return AddAbilityResult(
+                        name=_ability.name,
+                        added=False,
+                        reason="duplicate_agent",
+                    )
+                self._agents[_ability.name] = _ability
+                return AddAbilityResult(
+                    name=_ability.name,
+                    added=True,
+                    reason="added_agent",
+                )
+
+            elif isinstance(_ability, McpServerConfig):
+                existing = self._mcp_servers.get(_ability.server_name)
+                if existing is not None:
+                    logger.warning(
+                        f"Duplicate MCP server ability detected: "
+                        f"name='{_ability.server_name}', "
+                        f"existing_id='{existing.server_id}', "
+                        f"new_id='{_ability.server_id}'. "
+                        f"Keep existing ability and skip new one."
+                    )
+                    return AddAbilityResult(
+                        name=_ability.server_name,
+                        added=False,
+                        reason="duplicate_mcp_server",
+                    )
+                self._mcp_servers[_ability.server_name] = _ability
+                return AddAbilityResult(
+                    name=_ability.server_name,
+                    added=True,
+                    reason="added_mcp_server",
+                )
+
+            logger.warning(f"Unknown ability type: {type(_ability)}")
+            return AddAbilityResult(
+                name=getattr(_ability, "name", str(type(_ability))),
+                added=False,
+                reason="unknown_ability_type",
+            )
+
+        if isinstance(ability, list):
+            return [add_single_ability(item) for item in ability]
+
+        return add_single_ability(ability)
+
+    def add_ability(self, card: ToolCard, resource: Tool) -> AddAbilityResult:
+        """Register an executable tool ability (card + concrete instance).
+
+        Single entry point that keeps the ability-manager card id and the
+        resource-manager registration key consistent, branching on whether the
+        tool holds per-agent state:
+
+        - Stateful (``card.stateless`` is False, the default): the tool is owned
+            exclusively by this agent. The card id is rewritten to
+            ``f"{card.name}_{owner_id}"`` (derived from the name so a
+            pre-qualified id is idempotently normalized) and the instance is
+            (re)bound in the resource manager with ``refresh=True`` so a later
+            owner of the same id wins.
+        - Stateless (``card.stateless`` is True): the tool is a shared
+            module-level singleton. The bare id is kept and the resource-manager
+            add is an idempotent ``skip_if_exists`` no-op.
+
+        Args:
+            card: The tool card to register (``card`` is the same object as
+                ``resource.card`` for agent-owned tools).
+            resource: The concrete tool instance backing the card.
+
+        Returns:
+            The ability-manager add result for the (possibly id-rewritten) card.
+        """
+        from openjiuwen.core.runner import Runner
+
+        if card.stateless:
+            Runner.resource_mgr.add_tool(resource, skip_if_exists=True)
+            return self.add(card)
+
+        if self._owner_id:
+            card.id = f"{card.name}_{self._owner_id}"
+        Runner.resource_mgr.add_tool(resource, refresh=True)
+        return self.add(card)
+
+    def remove_ability(self, name: Union[str, List[str]]) -> None:
+        """Remove tool ability(ies) by name from this manager and the resource manager.
+
+        Mirrors :meth:`add_ability`: stateful tools are removed from the resource
+        manager by their agent-qualified id; stateless (shared) tools are dropped
+        from this manager only, leaving the shared resource-manager entry for
+        other agents still using it.
+        """
+        from openjiuwen.core.runner import Runner
+
+        names = name if isinstance(name, list) else [name]
+        for item in names:
+            card = self._tools.get(item)
+            self.remove(item)
+            if card is None or card.stateless:
+                continue
+            Runner.resource_mgr.remove_tool(card.id)
+
+    def teardown_tools(self) -> None:
+        """Drop this owner's agent-qualified stateful tools from the resource manager.
+
+        Round-end teardown calls this so a stopped agent does not leave its
+        per-agent (stateful) tool instances registered in the process-global
+        resource manager. Without it the next run cycle rebuilds a fresh agent
+        and re-registers every tool over the stale id, and :meth:`add_ability`'s
+        refresh path then logs a warning per residual id.
+
+        Only tools this manager qualified with its own owner id
+        (``card.id == f"{name}_{owner_id}"``) are removed; stateless shared
+        singletons and externally-scoped tools (e.g. MCP server-scoped ids) are
+        left in place for other agents still using them.
+        """
+        from openjiuwen.core.runner import Runner
+
+        if not self._owner_id:
+            return
+        for name, card in list(self._tools.items()):
+            if card.stateless or card.id != f"{name}_{self._owner_id}":
+                continue
+            self.remove(name)
+            Runner.resource_mgr.remove_tool(card.id)
+
+    def remove(self, name: Union[str, List[str]]) -> Union[None, Ability, List[Ability]]:
+        """Remove an ability by name
+
+        Args:
+            name: Ability name to remove
+
+        Returns:
+            Removed ability Card, or None if not found
+        """
+        if isinstance(name, str):
+            removed = None
+            if name in self._tools:
+                removed = self._tools.pop(name, None)
+            if name in self._workflows:
+                removed = self._workflows.pop(name, None)
+            if name in self._agents:
+                removed = self._agents.pop(name, None)
+            if name in self._mcp_servers:
+                # Remove MCP server and its tools
+                mcp_server = self._mcp_servers.pop(name, None)
+                if mcp_server:
+                    # Remove all tools belonging to this MCP server
+                    server_id = mcp_server.server_id
+                    tools_to_remove = [
+                        tool_name for tool_name, tool_card in self._tools.items()
+                        if tool_card.id and tool_card.id.startswith(f"{server_id}.")
+                    ]
+                    for tool_name in tools_to_remove:
+                        self._tools.pop(tool_name, None)
+                removed = mcp_server
+            return removed
+        elif isinstance(name, list):
+            result = []
+            for item in name:
+                removed = None
+                if item in self._tools:
+                    removed = self._tools.pop(item, None)
+                if item in self._workflows:
+                    removed = self._workflows.pop(item, None)
+                if item in self._agents:
+                    removed = self._agents.pop(item, None)
+                if item in self._mcp_servers:
+                    # Remove MCP server and its tools
+                    mcp_server = self._mcp_servers.pop(item, None)
+                    if mcp_server:
+                        # Remove all tools belonging to this MCP server
+                        server_id = mcp_server.server_id
+                        tools_to_remove = [
+                            tool_name for tool_name, tool_card in self._tools.items()
+                            if tool_card.id and tool_card.id.startswith(f"{server_id}.")
+                        ]
+                        for tool_name in tools_to_remove:
+                            self._tools.pop(tool_name, None)
+                    removed = mcp_server
+                result.append(removed)
+            return result
+        else:
+            return None
+
+    def reorder_tools(self, ordered_names: List[str]) -> None:
+        """Reorder registered tools to match the given preferred name order."""
+        if not ordered_names or not self._tools:
+            return
+        preferred = [name for name in ordered_names if name in self._tools]
+        if not preferred:
+            return
+        reordered: Dict[str, ToolCard] = {}
+        for name in preferred:
+            reordered[name] = self._tools[name]
+        for name, card in self._tools.items():
+            if name not in reordered:
+                reordered[name] = card
+        self._tools = reordered
+
+    def get(self, name: str) -> Optional[Ability]:
+        """Get an ability Card by name
+
+        Args:
+            name: Ability name
+
+        Returns:
+            Ability Card, or None if not found
+        """
+        if name in self._tools:
+            return self._tools[name]
+        if name in self._workflows:
+            return self._workflows[name]
+        if name in self._agents:
+            return self._agents[name]
+        if name in self._mcp_servers:
+            return self._mcp_servers[name]
+        return None
+
+    def list(self) -> List[Ability]:
+        """List all ability Cards
+
+        Returns:
+            List of all ability Cards
+        """
+        abilities: List[Ability] = []
+        abilities.extend(self._tools.values())
+        abilities.extend(self._workflows.values())
+        abilities.extend(self._agents.values())
+        abilities.extend(self._mcp_servers.values())
+        return abilities
+
+    @staticmethod
+    def _prioritize_paid_search(
+            tool_items: List[Tuple[str, ToolCard]]
+    ) -> List[Tuple[str, ToolCard]]:
+        """Keep paid_search ahead of free_search when both tools are exposed."""
+        names = [name for name, _ in tool_items]
+        if "paid_search" not in names or "free_search" not in names:
+            return tool_items
+        paid_index = names.index("paid_search")
+        free_index = names.index("free_search")
+        if paid_index < free_index:
+            return tool_items
+
+        reordered = list(tool_items)
+        paid_item = reordered.pop(paid_index)
+        free_index = next(
+            index for index, (name, _) in enumerate(reordered)
+            if name == "free_search"
+        )
+        reordered.insert(free_index, paid_item)
+        return reordered
+
+    async def list_tool_info(
+            self,
+            names: Optional[List[str]] = None,
+            mcp_server_name: Optional[str] = None
+    ) -> List[ToolInfo]:
+        """Get ToolInfo list (for LLM usage)
+
+        Args:
+            names: Filter by ability names (optional)
+            mcp_server_name: Filter by MCP server name (optional)
+
+        Returns:
+            List of ToolInfo objects for LLM
+        """
+        tool_infos: List[ToolInfo] = []
+
+        # Convert ToolCards to ToolInfo
+        for name, tool_card in self._prioritize_paid_search(list(self._tools.items())):
+            if names is None or name in names:
+                id_in_tool_card = tool_card.id
+                if not self._is_tool_in_mcp_server(id_in_tool_card):
+                    tool_info = ToolInfo(
+                        name=tool_card.name,
+                        description=tool_card.description or "",
+                        parameters=tool_card.input_params or {}
+                    )
+                    tool_infos.append(tool_info)
+
+        # Convert WorkflowCards to ToolInfo
+        for name, workflow_card in self._workflows.items():
+            if names is None or name in names:
+                tool_info = ToolInfo(
+                    name=workflow_card.name,
+                    description=workflow_card.description or "",
+                    parameters=workflow_card.input_params or {}
+                )
+                tool_infos.append(tool_info)
+
+        # Convert AgentCards to ToolInfo
+        for name, agent_card in self._agents.items():
+            if names is None or name in names:
+                # Build parameters from input_params
+                # input_params can be: None, dict (JSON Schema), or Type[BaseModel]
+                if agent_card.input_params is None:
+                    params = {"type": "object", "properties": {}, "required": []}
+                elif isinstance(agent_card.input_params, dict):
+                    # Already a JSON Schema dict, use directly
+                    params = agent_card.input_params
+                elif isinstance(agent_card.input_params, type) and issubclass(agent_card.input_params, BaseModel):
+                    # BaseModel type, convert to JSON Schema
+                    params = agent_card.input_params.model_json_schema()
+                else:
+                    # Fallback to default JSON Schema for unknown types
+                    params = {"type": "object", "properties": {}, "required": []}
+
+                tool_info = ToolInfo(
+                    name=agent_card.name,
+                    description=agent_card.description or "",
+                    parameters=params
+                )
+                tool_infos.append(tool_info)
+
+        # Handle MCP servers if needed
+        for mcp_server_name, mcp_server in self._mcp_servers.items():
+            mcp_server_id = mcp_server.server_id
+            from openjiuwen.core.runner import Runner
+            if names is None:
+                mcp_tool_infos = await Runner.resource_mgr.get_mcp_tool_infos(server_id=mcp_server_id)
+                for mcp_tool in mcp_tool_infos:
+                    mcp_tool_name = f"mcp_{mcp_server_name}_{mcp_tool.name}"
+                    mcp_tool_id = f'{mcp_server_id}.{mcp_server_name}.{mcp_tool.name}'
+                    mcp_tool.name = mcp_tool_name
+                    self._tools[mcp_tool_name] = ToolCard(id=mcp_tool_id, name=mcp_tool_name,
+                                                          description=mcp_tool.description,
+                                                          input_params=mcp_tool.parameters or {})
+                    tool_infos.append(mcp_tool)
+
+        return tool_infos
+
+    async def execute(
+            self,
+            ctx: AgentCallbackContext,
+            tool_call: Union[ToolCall, List[ToolCall]],
+            session: Session,
+            parallel_tool_calls: bool = True,
+            tag=None
+    ) -> List[Tuple[Any, ToolMessage]]:
+        """Execute ability call(s) with per-tool rail hooks.
+
+        Get instance from Runner.resource_mgr by card info, execute and return
+
+        Args:
+            ctx: Shared callback context for tool-call lifecycle
+            tool_call: Single tool call or list of tool calls
+            session: Session instance
+
+        Returns:
+            List of (result, ToolMessage) tuples
+        """
+        tool_calls = self._normalize_tool_calls(tool_call)
+        if not tool_calls:
+            return []
+
+        # Each tool call gets an isolated callback context to avoid races
+        # between concurrent BEFORE/AFTER_TOOL_CALL hooks.
+        tool_contexts: List[AgentCallbackContext] = []
+        tasks = []
+        for single_tool_call in tool_calls:
+            tool_ctx = AgentCallbackContext(
+                agent=ctx.agent,
+                inputs=ToolCallInputs(
+                    tool_call=single_tool_call,
+                    tool_name=single_tool_call.name,
+                    tool_args=single_tool_call.arguments,
+                ),
+                config=ctx.config,
+                session=session,
+                context=ctx.context,
+                extra=ctx.extra,
+            )
+            # Propagate steering queue so after_tool_call
+            # rails can push_steering() on the same queue.
+            if ctx.steering_queue is not None:
+                tool_ctx.bind_steering_queue(
+                    ctx.steering_queue
+                )
+            tool_contexts.append(tool_ctx)
+            tasks.append(
+                self._railed_execute_single_tool_call(
+                    ctx=tool_ctx,
+                    tool_call=single_tool_call,
+                    session=session,
+                    tag=tag,
+                )
+            )
+
+        results = []
+        if parallel_tool_calls:
+            # Execute all tool calls in parallel.
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+        else:
+            # Execute all tool calls in sequence.
+            for task in tasks:
+                try:
+                    result = await task
+                except Exception as e:
+                    result = e
+                results.append(result)
+
+        # Process results
+        final_results: List[Tuple[Any, ToolMessage]] = []
+        force_finish_requests: Dict[int, Dict[str, Any]] = {}
+        for i, result in enumerate(results):
+            tool_ctx = tool_contexts[i]
+            if isinstance(result, BaseException):
+                # Handle exception
+                if isinstance(result, ToolInterruptException):
+                    final_results.append((result, None))
+                    continue
+
+                if isinstance(result, asyncio.CancelledError):
+                    tc = tool_calls[i]
+                    error_msg = f"[Interrupted] Tool '{tc.name}' execution was cancelled by user."
+                    logger.warning(error_msg)
+                    tool_message = ToolMessage(
+                        content=error_msg,
+                        tool_call_id=tc.id,
+                    )
+                    final_results.append((None, tool_message))
+                    continue
+
+                error_msg = f"Ability execution error: {str(result)}"
+                logger.error(error_msg)
+
+                # Trigger TOOL_CALL_ERROR event for observability
+                # This only affects telemetry collection, not business logic
+                try:
+                    from openjiuwen.core.runner import Runner
+                    from openjiuwen.core.runner.callback.events import ToolCallEvents
+                    tc = tool_calls[i]
+                    await Runner.callback_framework.trigger(
+                        ToolCallEvents.TOOL_CALL_ERROR,
+                        tool_name=tc.name,
+                        tool_id=tc.id,
+                        error=result,
+                    )
+                except Exception as e:
+                    logger.warning(f"Failed to trigger TOOL_CALL_ERROR event: {e}")
+
+                tool_result = None
+                tool_message = None
+                if isinstance(tool_ctx.inputs, ToolCallInputs):
+                    tool_result = tool_ctx.inputs.tool_result
+                    tool_message = tool_ctx.inputs.tool_msg
+
+                if (
+                        tool_message is None
+                        and isinstance(result, AbilityExecutionError)
+                ):
+                    tool_message = result.tool_message
+
+                if tool_message is None:
+                    tool_message = ToolMessage(
+                        content=error_msg,
+                        tool_call_id=tool_calls[i].id
+                    )
+
+                final_results.append((tool_result, tool_message))
+                continue
+
+            if result is None and tool_ctx.has_force_finish_request:
+                finish = tool_ctx.consume_force_finish()
+                force_finish_result = finish.result if finish is not None else {}
+                force_finish_requests[i] = force_finish_result
+                tool_result = None
+                tool_msg = None
+                if isinstance(tool_ctx.inputs, ToolCallInputs):
+                    tool_result = (
+                        tool_ctx.inputs.tool_result
+                        if tool_ctx.inputs.tool_result is not None
+                        else force_finish_result
+                    )
+                    tool_msg = tool_ctx.inputs.tool_msg
+
+                if tool_msg is None:
+                    tool_msg = ToolMessage(
+                        content=str(force_finish_result),
+                        tool_call_id=tool_calls[i].id,
+                    )
+
+                final_results.append((tool_result, tool_msg))
+                continue
+
+            if isinstance(result, dict):
+                ff = tool_ctx.consume_force_finish()
+                force_finish_result = ff.result if ff is not None else result
+                force_finish_requests[i] = force_finish_result
+                tool_msg = ToolMessage(
+                    content=str(force_finish_result),
+                    tool_call_id=tool_calls[i].id,
+                )
+                tool_result = force_finish_result
+                if isinstance(tool_ctx.inputs, ToolCallInputs):
+                    if tool_ctx.inputs.tool_result is not None:
+                        tool_result = tool_ctx.inputs.tool_result
+                    if tool_ctx.inputs.tool_msg is not None:
+                        tool_msg = tool_ctx.inputs.tool_msg
+                final_results.append((tool_result, tool_msg))
+                continue
+
+            # AFTER_TOOL_CALL rails can rewrite tool_result/tool_msg in ctx.inputs.
+            if isinstance(tool_ctx.inputs, ToolCallInputs):
+                tool_result = (
+                    tool_ctx.inputs.tool_result
+                    if tool_ctx.inputs.tool_result is not None
+                    else result[0]
+                )
+                tool_msg = (
+                    tool_ctx.inputs.tool_msg
+                    if tool_ctx.inputs.tool_msg is not None
+                    else result[1]
+                )
+                final_results.append((tool_result, tool_msg))
+                continue
+
+            final_results.append(result)
+
+        # Propagate the first force_finish signal in tool-call order.
+        for i, tool_ctx in enumerate(tool_contexts):
+            ff = tool_ctx.consume_force_finish()
+            if ff is not None:
+                force_finish_requests[i] = ff.result
+        if force_finish_requests:
+            ctx.request_force_finish(
+                force_finish_requests[min(force_finish_requests)]
+            )
+
+        return final_results
+
+    @rail(
+        before=AgentCallbackEvent.BEFORE_TOOL_CALL,
+        after=AgentCallbackEvent.AFTER_TOOL_CALL,
+        on_exception=AgentCallbackEvent.ON_TOOL_EXCEPTION,
+    )
+    async def _railed_execute_single_tool_call(
+            self,
+            ctx: AgentCallbackContext,
+            tool_call: ToolCall,
+            session: Session,
+            tag=None,
+    ) -> Tuple[Any, ToolMessage]:
+        """Execute one tool call under rail lifecycle events."""
+        skip_result = ctx.extra.pop("_skip_tool", None)
+
+        if skip_result:
+            return ctx.inputs.tool_result, ctx.inputs.tool_msg
+
+        if isinstance(ctx.inputs, ToolCallInputs):
+            if ctx.inputs.tool_name:
+                tool_call.name = ctx.inputs.tool_name
+            if ctx.inputs.tool_args is not None:
+                tool_call.arguments = ctx.inputs.tool_args
+
+        result, tool_msg = await self._execute_single_tool_call(
+            tool_call=tool_call,
+            session=session,
+            tag=tag,
+        )
+
+        if isinstance(ctx.inputs, ToolCallInputs):
+            ctx.inputs.tool_call = tool_call
+            ctx.inputs.tool_name = tool_call.name
+            ctx.inputs.tool_args = tool_call.arguments
+            ctx.inputs.tool_result = result
+            ctx.inputs.tool_msg = tool_msg
+
+        return result, tool_msg
+
+    async def _run_workflow(
+            self,
+            workflow: Any,
+            workflow_id: str,
+            tool_args: Any,
+            session: Session,
+            tool_call: ToolCall,
+    ) -> Tuple[Any, Optional[ToolMessage]]:
+        """Run a workflow and return (result, tool_message).
+
+        Returns (WorkflowOutput, None) when INPUT_REQUIRED (interruption).
+        Returns (result, ToolMessage) on successful completion.
+        Raises AbilityExecutionError on failure (caller wraps in try/except).
+        """
+        from openjiuwen.core.runner import Runner
+        from openjiuwen.core.workflow import WorkflowOutput, WorkflowExecutionState
+
+        workflow_session = session.create_workflow_session() if session is not None else None
+        workflow_context = (
+            await self._context_engine.create_context(context_id=workflow_id, session=session)
+            if self._context_engine is not None
+            else None
+        )
+        workflow_output = await Runner.run_workflow(
+            workflow,
+            inputs=tool_args,
+            session=workflow_session,
+            context=workflow_context,
+        )
+        if (
+            isinstance(workflow_output, WorkflowOutput)
+            and workflow_output.state == WorkflowExecutionState.INPUT_REQUIRED
+        ):
+            return workflow_output, None
+
+        result = workflow_output.result if isinstance(workflow_output, WorkflowOutput) else workflow_output
+        return result, ToolMessage(content=str(result), tool_call_id=tool_call.id)
+
+    async def _execute_single_tool_call(self, tool_call: ToolCall, session: Session,
+                                        tag=None) -> Tuple[Any, ToolMessage]:
+        tool_name = tool_call.name
+
+        # Parse arguments
+        try:
+            tool_args, repaired_arguments = self._parse_tool_arguments_with_repair(tool_call.arguments)
+            if repaired_arguments is not None:
+                tool_call.arguments = repaired_arguments
+        except ValueError as exc:
+            logger.error(f"Tool '{tool_name}' got malformed arguments: {exc}")
+            raise self._build_execution_error(tool_call, str(exc)) from exc
+
+        # Check ability type and execute accordingly
+        if tool_name in self._tools:
+            # Execute Tool - get instance from Runner.resource_mgr
+            tool_card = self._tools[tool_name]
+            tool_id = tool_card.id or tool_card.name
+            from openjiuwen.core.runner import Runner
+            tool = Runner.resource_mgr.get_tool(tool_id=tool_id, tag=tag, session=session)
+            if not tool:
+                raise self._build_execution_error(
+                    tool_call,
+                    f"Tool instance not found in resource_mgr: {tool_id}",
+                )
+            try:
+                result = await tool.invoke(tool_args, session=session)
+            except Exception as e:
+                error_msg = f"Tool execution error: {str(e)}"
+                logger.error(error_msg)
+                raise self._build_execution_error(
+                    tool_call,
+                    error_msg,
+                ) from e
+        elif tool_name in self._workflows:
+            workflow_card = self._workflows[tool_name]
+            workflow_id = workflow_card.id or workflow_card.name
+            from openjiuwen.core.runner import Runner
+            workflow = await Runner.resource_mgr.get_workflow(workflow_id=workflow_id, tag=tag, session=session)
+            if not workflow:
+                raise self._build_execution_error(
+                    tool_call,
+                    f"Workflow instance not found in resource_mgr: {workflow_id}"
+                )
+            try:
+                return await self._run_workflow(workflow, workflow_id, tool_args, session, tool_call)
+            except Exception as e:
+                error_msg = f"Workflow execution error: {str(e)}"
+                logger.error(error_msg)
+                raise self._build_execution_error(tool_call, error_msg) from e
+        elif tool_name in self._agents:
+            # Execute sub-Agent - get instance from Runner.resource_mgr
+            agent_card = self._agents[tool_name]
+            agent_id = agent_card.id or agent_card.name
+            from openjiuwen.core.runner import Runner
+            agent = await Runner.resource_mgr.get_agent(agent_id=agent_id, session=session)
+            if not agent:
+                raise self._build_execution_error(
+                    tool_call,
+                    f"Agent instance not found in resource_mgr: {agent_id}"
+                )
+            try:
+                child_session_id = f"{session.get_session_id()}:{tool_call.id}"
+                tool_args["conversation_id"] = child_session_id
+
+                stream_writer_manager = self._get_stream_writer_manager(session)
+                child_session_kwargs = {}
+                if stream_writer_manager is not None:
+                    child_session_kwargs = {
+                        "stream_writer_manager": stream_writer_manager,
+                        "close_stream_on_post_run": False,
+                        "source_metadata": {"source_agent_id": agent.card.id},
+                    }
+
+                child_session = create_agent_session(
+                    session_id=child_session_id,
+                    card=agent.card,
+                    **child_session_kwargs,
+                )
+
+                auto_confirm_config = session.get_state(INTERRUPT_AUTO_CONFIRM_KEY)
+                if auto_confirm_config:
+                    child_session.update_state({INTERRUPT_AUTO_CONFIRM_KEY: auto_confirm_config})
+
+                result = await Runner.run_agent(agent=agent, inputs=tool_args, session=child_session)
+            except Exception as e:
+                error_msg = f"Agent execution error: {str(e)}"
+                logger.error(error_msg)
+                raise self._build_execution_error(
+                    tool_call,
+                    error_msg,
+                ) from e
+        elif tool_name in self._mcp_servers:
+            # Execute MCP tool
+            raise self._build_execution_error(
+                tool_call,
+                f"MCP tool execution not yet implemented: {tool_name}",
+            )
+        else:
+            # Fallback: try to get tool from Runner.resource_mgr by name
+            from openjiuwen.core.runner import Runner
+            tool = Runner.resource_mgr.get_tool(tool_id=tool_name, tag=tag, session=session)
+            if not tool:
+                raise self._build_execution_error(
+                    tool_call,
+                    f"Ability not found in resource_mgr: {tool_name}",
+                )
+            try:
+                result = await tool.invoke(tool_args, session=session)
+            except Exception as e:
+                error_msg = f"Tool execution error: {str(e)}"
+                logger.error(error_msg)
+                raise self._build_execution_error(
+                    tool_call,
+                    error_msg,
+                ) from e
+
+        # Build ToolMessage for successful execution.
+        content = self._build_tool_message_content(result)
+        tool_message = ToolMessage(
+            content=content,
+            tool_call_id=tool_call.id
+        )
+
+        return result, tool_message
+
+    def _is_tool_in_mcp_server(self, id_in_tool_card):
+        mcp_server_id = [mcp_server.server_id for _, mcp_server in self._mcp_servers.items()]
+        return any([id_in_tool_card.startswith(f"{mid}.") for mid in mcp_server_id])

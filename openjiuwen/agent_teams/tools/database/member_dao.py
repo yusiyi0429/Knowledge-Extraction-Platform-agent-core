@@ -1,0 +1,315 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Member table data access object."""
+
+from typing import List, Optional
+
+from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
+
+from openjiuwen.agent_teams.schema.status import (
+    EXECUTION_TRANSITIONS,
+    MEMBER_TRANSITIONS,
+    ExecutionStatus,
+    MemberMode,
+    MemberStatus,
+    is_valid_transition,
+)
+from openjiuwen.agent_teams.tools.database.engine import DbSessions, get_current_time
+from openjiuwen.agent_teams.tools.member_options import (
+    MemberWorktreeOptions,
+    set_member_worktree_options,
+)
+from openjiuwen.agent_teams.tools.models import TeamMember
+from openjiuwen.core.common.logging import team_logger
+
+
+class MemberDao:
+    """Data access object for the team_member table."""
+
+    def __init__(self, sessions: DbSessions) -> None:
+        """Initialize member DAO with the shared read/write session provider."""
+        self._sessions = sessions
+
+    async def create_member(
+        self,
+        member_name: str,
+        team_name: str,
+        display_name: str,
+        agent_card: str,
+        status: str,
+        *,
+        role: str = "teammate",
+        desc: Optional[str] = None,
+        execution_status: Optional[str] = None,
+        mode: str = MemberMode.BUILD_MODE.value,
+        prompt: Optional[str] = None,
+        options: Optional[str] = None,
+    ) -> bool:
+        """Create a new team member.
+
+        Args:
+            role: ``TeamRole`` enum value (``leader`` / ``teammate`` /
+                ``human_agent``). Persisted so cold-recovery can rebuild
+                the right runtime profile (tools / rails / prompt
+                sections) without depending on the leader's in-memory
+                roster. Defaults to ``"teammate"`` (the literal value
+                of ``TeamRole.TEAMMATE``; spelled as a literal to keep
+                this module out of the ``schema.team`` import cycle)
+                because that matches the overwhelmingly common spawn
+                path. HITT callers must pass
+                ``role=TeamRole.HUMAN_AGENT.value`` explicitly.
+            options: JSON object for extensible member configuration.
+                Current shape: ``{"model_ref": {...}, "worktree": {...},
+                "permissions_override": {...}}``.
+        """
+        async with self._sessions.write() as session:
+            try:
+                member = TeamMember(
+                    member_name=member_name,
+                    team_name=team_name,
+                    display_name=display_name,
+                    agent_card=agent_card,
+                    status=status,
+                    role=role,
+                    desc=desc,
+                    execution_status=execution_status,
+                    mode=mode,
+                    prompt=prompt,
+                    options=options,
+                    updated_at=get_current_time(),
+                )
+                session.add(member)
+                await session.commit()
+                team_logger.info("Member %s created", member_name)
+                return True
+            except IntegrityError:
+                await session.rollback()
+                team_logger.error("Member %s already exists", member_name)
+                return False
+
+    async def is_human_agent(self, team_name: str, member_name: str) -> bool:
+        """Return True if ``member_name`` is a human-agent member.
+
+        Single-row probe (index-friendly) for the common case of
+        checking one member's role without scanning the full roster.
+        """
+        from openjiuwen.agent_teams.schema.team import TeamRole
+
+        async with self._sessions.read() as session:
+            stmt = select(TeamMember.member_name).where(
+                TeamMember.team_name == team_name,
+                TeamMember.member_name == member_name,
+                TeamMember.role == TeamRole.HUMAN_AGENT.value,
+            )
+            return (await session.execute(stmt)).scalar_one_or_none() is not None
+
+    async def list_human_agent_names(self, team_name: str) -> list[str]:
+        """Return member names whose ``role`` is ``human_agent``.
+
+        Used by ``TeamBackend.human_agent_names()`` to enumerate all
+        human-agent members on the team.
+        """
+        from openjiuwen.agent_teams.schema.team import TeamRole
+
+        async with self._sessions.read() as session:
+            stmt = select(TeamMember.member_name).where(
+                TeamMember.team_name == team_name,
+                TeamMember.role == TeamRole.HUMAN_AGENT.value,
+            )
+            return list((await session.execute(stmt)).scalars().all())
+
+    async def get_member(self, member_name: str, team_name: str) -> Optional[TeamMember]:
+        """Get member information by ID."""
+        async with self._sessions.read() as session:
+            result = await session.execute(
+                select(TeamMember).where(
+                    TeamMember.member_name == member_name,
+                    TeamMember.team_name == team_name,
+                )
+            )
+            return result.scalar_one_or_none()
+
+    async def get_team_members(self, team_name: str, status: str | None = None) -> List[TeamMember]:
+        """Get members for a team, optionally filtered by status.
+
+        Args:
+            team_name: Team identifier.
+            status: If provided, only return members with this status.
+        """
+        async with self._sessions.read() as session:
+            stmt = select(TeamMember).where(TeamMember.team_name == team_name)
+            if status is not None:
+                stmt = stmt.where(TeamMember.status == status)
+            return (await session.execute(stmt)).scalars().all()
+
+    async def get_members_max_updated_at(self, team_name: str) -> int:
+        """Probe MAX(``team_member.updated_at``) for the team.
+
+        Args:
+            team_name: Team identifier.
+
+        Returns:
+            Largest member update timestamp (ms), or ``0`` when no
+            members exist or all rows have null ``updated_at``.
+        """
+        async with self._sessions.read() as session:
+            result = await session.execute(
+                select(func.max(TeamMember.updated_at)).where(TeamMember.team_name == team_name)
+            )
+            value = result.scalar_one_or_none()
+            return int(value) if value is not None else 0
+
+    async def update_member_status(
+        self,
+        member_name: str,
+        team_name: str,
+        status: str,
+    ) -> bool:
+        """Update member status."""
+        async with self._sessions.write() as session:
+            result = await session.execute(
+                select(TeamMember).where(
+                    TeamMember.member_name == member_name,
+                    TeamMember.team_name == team_name,
+                )
+            )
+            member = result.scalar_one_or_none()
+            if not member:
+                team_logger.error("Member %s not found in team %s", member_name, team_name)
+                return False
+
+            if not is_valid_transition(
+                MemberStatus(member.status),
+                MemberStatus(status),
+                MEMBER_TRANSITIONS,
+            ):
+                team_logger.error(
+                    "Invalid state transition for member %s: %s -> %s",
+                    member_name,
+                    member.status,
+                    status,
+                )
+                return False
+
+            member.status = status
+            await session.commit()
+            team_logger.debug("Member %s status updated to %s", member_name, status)
+            return True
+
+    async def try_transition_member_status(
+        self,
+        member_name: str,
+        team_name: str,
+        from_status: MemberStatus,
+        to_status: MemberStatus,
+    ) -> bool:
+        """Atomically transition member status from from_status to to_status.
+
+        Uses a single UPDATE with WHERE status = from_status so only
+        one concurrent caller can succeed (rowcount=1). The database
+        transaction ensures atomicity; if the WHERE clause no longer
+        matches, rowcount=0 and the method returns False.
+
+        Args:
+            member_name: The member whose status to transition.
+            team_name: The team the member belongs to.
+            from_status: The expected current status (must match).
+            to_status: The target status.
+
+        Returns:
+            True if the transition succeeded, False otherwise.
+        """
+        async with self._sessions.write() as session:
+            result = await session.execute(
+                update(TeamMember)
+                .where(
+                    TeamMember.member_name == member_name,
+                    TeamMember.team_name == team_name,
+                    TeamMember.status == from_status.value,
+                )
+                .values(status=to_status.value)
+            )
+            await session.commit()
+            transitioned = result.rowcount == 1
+            if not transitioned:
+                team_logger.debug(
+                    "CAS %s -> %s for member %s failed (rowcount=%s)",
+                    from_status.value,
+                    to_status.value,
+                    member_name,
+                    result.rowcount,
+                )
+            return transitioned
+
+    async def update_member_execution_status(
+        self,
+        member_name: str,
+        team_name: str,
+        execution_status: str,
+    ) -> bool:
+        """Update member execution status."""
+        async with self._sessions.write() as session:
+            result = await session.execute(
+                select(TeamMember).where(
+                    TeamMember.member_name == member_name,
+                    TeamMember.team_name == team_name,
+                )
+            )
+            member = result.scalar_one_or_none()
+            if not member:
+                team_logger.error("Member %s not found in team %s", member_name, team_name)
+                return False
+
+            if not is_valid_transition(
+                ExecutionStatus(member.execution_status),
+                ExecutionStatus(execution_status),
+                EXECUTION_TRANSITIONS,
+            ):
+                team_logger.error(
+                    "Invalid state transition for member %s: %s -> %s",
+                    member_name,
+                    member.execution_status,
+                    execution_status,
+                )
+                return False
+
+            member.execution_status = execution_status
+            await session.commit()
+            team_logger.debug(
+                "Member %s execution status updated to %s",
+                member_name,
+                execution_status,
+            )
+            return True
+
+    async def update_member_worktree(
+        self,
+        member_name: str,
+        team_name: str,
+        worktree: MemberWorktreeOptions | None = None,
+        *,
+        isolation: Optional[str] = None,
+        worktree_path: Optional[str] = None,
+    ) -> bool:
+        """Update worktree isolation metadata for a member."""
+        async with self._sessions.write() as session:
+            result = await session.execute(
+                select(TeamMember).where(
+                    TeamMember.member_name == member_name,
+                    TeamMember.team_name == team_name,
+                )
+            )
+            member = result.scalar_one_or_none()
+            if not member:
+                team_logger.error("Member %s not found in team %s", member_name, team_name)
+                return False
+            member.options = set_member_worktree_options(
+                member.options,
+                worktree,
+                isolation=isolation,
+                worktree_path=worktree_path,
+            )
+            await session.commit()
+            return True

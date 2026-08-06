@@ -1,0 +1,1200 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Unit tests for HITT (Human in the Team) feature.
+
+Covers:
+- Reserved name enforcement and auto-injection by ``TeamAgentSpec``.
+- ``TeamBackend.build_team(enable_hitt=True)`` registering the
+  human_agent member as READY.
+- Human agent tool permission filtering.
+- Task lock (``UpdateTaskTool``) honoring the human_agent claim.
+- Message manager auto-marking messages to/for human_agent as read.
+- ``interaction`` module routing (parse_mention, UserInbox,
+  HumanAgentInbox).
+- ``prompts.sections.build_team_hitt_section`` role-specific content.
+"""
+
+from unittest.mock import AsyncMock
+
+import pytest
+import pytest_asyncio
+
+from openjiuwen.agent_teams.constants import (
+    HUMAN_AGENT_MEMBER_NAME,
+    RESERVED_MEMBER_NAMES,
+    USER_PSEUDO_MEMBER_NAME,
+)
+from openjiuwen.agent_teams.context import (
+    reset_session_id,
+    set_session_id,
+)
+from openjiuwen.agent_teams.interaction import (
+    HumanAgentInbox,
+    HumanAgentNotEnabledError,
+    UserInbox,
+    is_reserved_name,
+    parse_mention,
+)
+from openjiuwen.agent_teams.messager import Messager
+from openjiuwen.agent_teams.prompts import build_team_hitt_section
+from openjiuwen.agent_teams.schema.blueprint import (
+    LeaderSpec,
+    TeamAgentSpec,
+)
+from openjiuwen.agent_teams.schema.deep_agent_spec import DeepAgentSpec
+from openjiuwen.agent_teams.schema.status import (
+    ExecutionStatus,
+    MemberStatus,
+    TaskStatus,
+)
+from openjiuwen.agent_teams.schema.team import (
+    TeamMemberSpec,
+    TeamRole,
+)
+from openjiuwen.agent_teams.tools.database import (
+    DatabaseConfig,
+    DatabaseType,
+    TeamDatabase,
+)
+from openjiuwen.agent_teams.tools.team import CapabilityOverrides, TeamBackend
+from openjiuwen.agent_teams.tools.team_tools import (
+    HUMAN_AGENT_TOOLS,
+    create_team_tools,
+)
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def db_config() -> DatabaseConfig:
+    return DatabaseConfig(db_type=DatabaseType.SQLITE, connection_string=":memory:")
+
+
+@pytest_asyncio.fixture
+async def db(db_config):
+    token = set_session_id("hitt_session")
+    database = TeamDatabase(db_config)
+    try:
+        await database.initialize()
+        yield database
+    finally:
+        await database.close()
+        reset_session_id(token)
+
+
+@pytest_asyncio.fixture
+async def messager():
+    yield AsyncMock(spec=Messager)
+
+
+@pytest_asyncio.fixture
+async def team_backend(db, messager):
+    backend = TeamBackend(
+        team_name="hitt_team",
+        member_name="team_leader",
+        is_leader=True,
+        db=db,
+        messager=messager,
+    )
+    yield backend
+
+
+@pytest_asyncio.fixture
+async def hitt_team_backend(db, messager):
+    """TeamBackend with HITT capability enabled and a default human_agent predefined.
+
+    Mirrors the old "enable_hitt=True auto-injects default human_agent"
+    convenience that legacy fixtures relied on, but expressed via the new
+    explicit-declaration contract.
+    """
+    backend = TeamBackend(
+        team_name="hitt_team",
+        member_name="team_leader",
+        is_leader=True,
+        db=db,
+        messager=messager,
+        predefined_members=[
+            TeamMemberSpec(
+                member_name=HUMAN_AGENT_MEMBER_NAME,
+                display_name="Human",
+                role_type=TeamRole.HUMAN_AGENT,
+                persona="Default human collaborator",
+            ),
+        ],
+        enable_hitt=True,
+    )
+    yield backend
+
+
+# ---------------------------------------------------------------------------
+# Router / reserved names
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.level0
+def test_parse_mention_returns_target_and_body():
+    assert parse_mention("@dev-1 please start task 123") == (
+        "dev-1",
+        "please start task 123",
+    )
+
+
+@pytest.mark.level0
+def test_parse_mention_none_when_no_prefix():
+    assert parse_mention("just a regular message") is None
+
+
+@pytest.mark.level0
+def test_parse_mention_none_when_empty():
+    assert parse_mention("") is None
+
+
+@pytest.mark.level0
+def test_parse_mention_none_when_only_mention():
+    # "@dev-1" without body → no body group, regex miss
+    assert parse_mention("@dev-1") is None
+
+
+@pytest.mark.level0
+def test_parse_mention_allows_reserved_target():
+    # Reserved names are valid mention targets: user may @leader / @human_agent
+    parsed = parse_mention("@human_agent you decide")
+    assert parsed == ("human_agent", "you decide")
+
+
+@pytest.mark.level0
+def test_is_reserved_name_enforced():
+    for name in ("user", "team_leader", "human_agent"):
+        assert is_reserved_name(name) is True
+    assert is_reserved_name("backend-dev-1") is False
+
+
+# ---------------------------------------------------------------------------
+# TeamAgentSpec — auto-injection + validation
+# ---------------------------------------------------------------------------
+
+
+def _minimal_spec(**overrides) -> TeamAgentSpec:
+    agents = {"leader": DeepAgentSpec()}
+    base: dict = {"agents": agents, "team_name": "hitt_team"}
+    base.update(overrides)
+    return TeamAgentSpec(**base)
+
+
+@pytest.mark.level0
+def test_enable_hitt_with_declared_human_agent_passes_validation():
+    """Spec.enable_hitt=True with at least one HUMAN_AGENT predefined is valid."""
+    pre = TeamMemberSpec(
+        member_name=HUMAN_AGENT_MEMBER_NAME,
+        display_name="Custom Human",
+        role_type=TeamRole.HUMAN_AGENT,
+        persona="Custom persona",
+    )
+    spec = _minimal_spec(enable_hitt=True, predefined_members=[pre])
+    spec._validate_hitt_consistency()  # must not raise
+
+
+@pytest.mark.level0
+def test_enable_hitt_true_without_human_agent_predefined_passes():
+    """Spec.enable_hitt=True with no predefined HUMAN_AGENT is allowed (dynamic spawn path)."""
+    spec = _minimal_spec(enable_hitt=True)
+    spec._validate_hitt_consistency()  # must not raise
+
+
+@pytest.mark.level0
+def test_enable_hitt_false_with_human_agent_predefined_raises():
+    """Spec.enable_hitt=False with a HUMAN_AGENT predefined is a misconfiguration."""
+    pre = TeamMemberSpec(
+        member_name=HUMAN_AGENT_MEMBER_NAME,
+        display_name="Custom Human",
+        role_type=TeamRole.HUMAN_AGENT,
+        persona="Custom persona",
+    )
+    spec = _minimal_spec(enable_hitt=False, predefined_members=[pre])
+    from openjiuwen.core.common.exception.errors import BaseError
+
+    with pytest.raises(BaseError, match="enable_hitt=False"):
+        spec._validate_hitt_consistency()
+
+
+@pytest.mark.level0
+def test_enable_hitt_false_no_human_agent_predefined_passes():
+    """Spec.enable_hitt=False with no HUMAN_AGENT predefined is the default valid case."""
+    spec = _minimal_spec(enable_hitt=False)
+    spec._validate_hitt_consistency()  # must not raise
+
+
+@pytest.mark.level0
+def test_leader_member_name_cannot_be_reserved():
+    spec = _minimal_spec(leader=LeaderSpec(member_name=HUMAN_AGENT_MEMBER_NAME))
+    with pytest.raises(ValueError, match="reserved"):
+        spec._validate_reserved_names()
+
+
+@pytest.mark.level0
+def test_predefined_member_cannot_use_reserved_name():
+    pre = TeamMemberSpec(
+        member_name=USER_PSEUDO_MEMBER_NAME,
+        display_name="x",
+        persona="x",
+    )
+    spec = _minimal_spec(predefined_members=[pre])
+    with pytest.raises(ValueError, match="reserved name"):
+        spec._validate_reserved_names()
+
+
+# ---------------------------------------------------------------------------
+# TeamBackend — human_agent registration
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_with_predefined_human_agent_registers_member(hitt_team_backend, db):
+    """Spec-declared HUMAN_AGENT members are spawned during build_team when HITT is on."""
+    await hitt_team_backend.build_team(
+        display_name="HITT Team",
+        desc="test",
+        leader_display_name="Leader",
+        leader_desc="Leader persona",
+    )
+    member = await db.member.get_member(HUMAN_AGENT_MEMBER_NAME, "hitt_team")
+    assert member is not None
+    # Phase 2: human agent enters the standard UNSTARTED → spawn flow so
+    # the leader's startup sweep brings up a real DeepAgent for it.
+    assert member.status == MemberStatus.UNSTARTED.value
+    assert member.execution_status == ExecutionStatus.IDLE.value
+    assert hitt_team_backend.hitt_enabled() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_without_hitt_skips_human_agent(team_backend, db):
+    """No HUMAN_AGENT predefined and HITT off → no human members get spawned."""
+    await team_backend.build_team(
+        display_name="Plain Team",
+        desc="test",
+        leader_display_name="Leader",
+        leader_desc="Leader persona",
+    )
+    member = await db.member.get_member(HUMAN_AGENT_MEMBER_NAME, "hitt_team")
+    assert member is None
+    assert team_backend.hitt_enabled() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_arg_enable_hitt_true_with_spec_false_raises(team_backend):
+    """build_team(enable_hitt=True) cannot exceed the spec ceiling when spec.enable_hitt=False."""
+    from openjiuwen.core.common.exception.errors import BaseError
+
+    with pytest.raises(BaseError, match="capability ceiling"):
+        await team_backend.build_team(
+            display_name="x",
+            desc="y",
+            leader_display_name="Leader",
+            leader_desc="z",
+            overrides=CapabilityOverrides(enable_hitt=True),
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_arg_enable_hitt_false_overrides_spec_true(hitt_team_backend, db):
+    """build_team(enable_hitt=False) downgrades the runtime flag, skips predefined humans."""
+    await hitt_team_backend.build_team(
+        display_name="HITT Team",
+        desc="test",
+        leader_display_name="Leader",
+        leader_desc="Leader persona",
+        overrides=CapabilityOverrides(enable_hitt=False),
+    )
+    member = await db.member.get_member(HUMAN_AGENT_MEMBER_NAME, "hitt_team")
+    assert member is None
+    assert hitt_team_backend.hitt_enabled() is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_arg_enable_hitt_none_inherits_spec(hitt_team_backend):
+    """build_team(enable_hitt=None) inherits the spec ceiling — HITT stays engaged."""
+    await hitt_team_backend.build_team(
+        display_name="HITT Team",
+        desc="test",
+        leader_display_name="Leader",
+        leader_desc="Leader persona",
+    )
+    assert hitt_team_backend.hitt_enabled() is True
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_backend_spawn_human_agent_blocked_when_hitt_disabled(team_backend):
+    """Direct backend.spawn_human_agent gate prevents human spawn when HITT is off."""
+    result = await team_backend.spawn_human_agent(member_name="alice")
+    assert result.ok is False
+    assert "HITT capability is disabled" in (result.reason or "")
+
+
+# ---------------------------------------------------------------------------
+# Tool permissions
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_human_agent_role_tool_set(team_backend):
+    """human_agent gets view_task + member_complete_task + send_message —
+    no claim_task and no leader-only coordination tools.
+
+    ``send_message`` is exposed so the user can ask the avatar to relay
+    outbound messages ("tell the leader I'm in a meeting"); the HITT
+    prompt section enforces the "user-driven only" constraint, not the
+    tool's ``invoke()``.
+
+    workspace_meta is attached by TeamToolRail elsewhere when a
+    workspace_manager is configured, so it's not part of this set.
+    """
+    tools = create_team_tools(role="human_agent", agent_team=team_backend)
+    names = sorted(tool.card.name for tool in tools if tool.card is not None)
+    assert names == sorted(HUMAN_AGENT_TOOLS)
+    assert "send_message" in names
+    assert "member_complete_task" in names
+    assert "view_task" in names
+    assert "claim_task" not in names
+    assert "update_task" not in names
+    assert "spawn_teammate" not in names
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_leader_role_tools_exclude_human_agent_only(team_backend):
+    tools = create_team_tools(role="leader", agent_team=team_backend)
+    names = {tool.card.name for tool in tools if tool.card is not None}
+    # Leader must retain build_team/update_task/create_task/send_message etc.
+    assert {"build_team", "update_task", "send_message"}.issubset(names)
+    # member_complete_task is a member-side tool, not a leader-side one
+    assert "member_complete_task" not in names
+
+
+# ---------------------------------------------------------------------------
+# Task lock (UpdateTaskTool) — leader cannot cancel/reassign human_agent tasks
+# ---------------------------------------------------------------------------
+
+
+@pytest_asyncio.fixture
+async def built_team(hitt_team_backend, db):
+    await hitt_team_backend.build_team(
+        display_name="HITT Team",
+        desc="t",
+        leader_display_name="Leader",
+        leader_desc="persona",
+    )
+    yield hitt_team_backend
+
+
+async def _create_and_assign(backend, db, task_id: str, assignee: str) -> None:
+    create_result = await backend.task_manager.add(
+        title="t",
+        content="c",
+        task_id=task_id,
+    )
+    assert create_result.ok, create_result.reason
+    result = await backend.task_manager.assign(task_id, assignee)
+    assert result.ok, result.reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_cancel_task_owned_by_human_agent_is_refused(built_team, db):
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.team_tools import UpdateTaskTool
+
+    await _create_and_assign(built_team, db, "t-1", HUMAN_AGENT_MEMBER_NAME)
+    tool = UpdateTaskTool(built_team, make_translator("cn"))
+    out = await tool.invoke({"task_id": "t-1", "status": "cancelled"})
+    assert out.success is False
+    assert "人类成员" in out.error
+    # Task itself must still be claimed by human_agent.
+    task = await built_team.task_manager.get("t-1")
+    assert task.status == TaskStatus.CLAIMED.value
+    assert task.assignee == HUMAN_AGENT_MEMBER_NAME
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_reassign_task_owned_by_human_agent_is_refused(built_team, db):
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.team_tools import UpdateTaskTool
+
+    await _create_and_assign(built_team, db, "t-2", HUMAN_AGENT_MEMBER_NAME)
+    tool = UpdateTaskTool(built_team, make_translator("cn"))
+    out = await tool.invoke({"task_id": "t-2", "assignee": "other-member"})
+    assert out.success is False
+    assert "人类成员" in out.error
+    task = await built_team.task_manager.get("t-2")
+    assert task.assignee == HUMAN_AGENT_MEMBER_NAME
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_cancel_all_preserves_human_agent_claimed_task(built_team, db):
+    # One human-claimed + one unassigned: cancel_all must keep the former.
+    await _create_and_assign(built_team, db, "t-human", HUMAN_AGENT_MEMBER_NAME)
+    await built_team.task_manager.add(
+        title="open",
+        content="c",
+        task_id="t-open",
+    )
+
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.team_tools import UpdateTaskTool
+
+    tool = UpdateTaskTool(built_team, make_translator("cn"))
+    out = await tool.invoke({"task_id": "*", "status": "cancelled"})
+    assert out.success is True
+
+    preserved = await built_team.task_manager.get("t-human")
+    released = await built_team.task_manager.get("t-open")
+    assert preserved.status == TaskStatus.CLAIMED.value
+    assert released.status == TaskStatus.CANCELLED.value
+
+
+# ---------------------------------------------------------------------------
+# Message auto-read
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_direct_message_to_human_agent_stays_unread(built_team, db):
+    """Messages addressed to a human-agent must remain unread on write.
+
+    Human agents share the polling mailbox path with teammates — the
+    coordination MessageHandler drains unread messages and feeds them
+    into the avatar's DeepAgent via deliver_input. Auto-marking on write
+    used to pre-empt that path and prevent delivery; see
+    F_20_human-agent-mailbox-unread-flip.
+    """
+    mm = built_team.message_manager
+    msg_id = await mm.send_message(
+        content="please review",
+        to_member_name=HUMAN_AGENT_MEMBER_NAME,
+    )
+    assert msg_id is not None
+    messages = await mm.get_messages(to_member_name=HUMAN_AGENT_MEMBER_NAME)
+    assert len(messages) == 1
+    assert messages[0].is_read is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_direct_message_to_regular_member_is_unread(team_backend, db):
+    # Register a non-human member first.
+    await team_backend.build_team(
+        display_name="plain",
+        desc="t",
+        leader_display_name="Leader",
+        leader_desc="p",
+        overrides=CapabilityOverrides(enable_hitt=False),
+    )
+    from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+
+    await team_backend.spawn_member(
+        member_name="dev-1",
+        display_name="Dev",
+        agent_card=AgentCard(name="Dev"),
+    )
+    msg_id = await team_backend.message_manager.send_message(
+        content="hi",
+        to_member_name="dev-1",
+    )
+    assert msg_id is not None
+    messages = await team_backend.message_manager.get_messages(to_member_name="dev-1")
+    assert len(messages) == 1
+    assert messages[0].is_read is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_broadcast_to_human_agent_stays_unread(built_team, db):
+    """Broadcasts to a human-agent must remain unread on write.
+
+    Same rationale as the direct-message test — the polling mailbox path
+    is what delivers broadcasts into the avatar's DeepAgent. See
+    F_20_human-agent-mailbox-unread-flip.
+    """
+    mm = built_team.message_manager
+    msg_id = await mm.broadcast_message(content="global announcement")
+    assert msg_id is not None
+    unread = await mm.get_broadcast_messages(
+        member_name=HUMAN_AGENT_MEMBER_NAME,
+        unread_only=True,
+    )
+    assert len(unread) == 1
+    assert unread[0].message_id == msg_id
+
+
+# ---------------------------------------------------------------------------
+# Interaction inboxes
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_user_inbox_direct_writes_as_user(team_backend, db):
+    await team_backend.build_team(
+        display_name="t",
+        desc="t",
+        leader_display_name="Leader",
+        leader_desc="p",
+    )
+    from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+
+    await team_backend.spawn_member(
+        member_name="alice",
+        display_name="Alice",
+        agent_card=AgentCard(name="Alice"),
+    )
+    inbox = UserInbox(team_backend.message_manager)
+    msg_id = await inbox.direct("alice", "look at this")
+    assert msg_id is not None
+    stored = await team_backend.message_manager.get_messages(to_member_name="alice")
+    assert len(stored) == 1
+    assert stored[0].from_member_name == USER_PSEUDO_MEMBER_NAME
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_user_inbox_broadcast_writes_as_user(team_backend, db):
+    await team_backend.build_team(
+        display_name="t",
+        desc="t",
+        leader_display_name="Leader",
+        leader_desc="p",
+    )
+    inbox = UserInbox(team_backend.message_manager)
+    msg_id = await inbox.broadcast("everyone read this")
+    assert msg_id is not None
+    broadcasts = await team_backend.message_manager.get_broadcast_messages(member_name="team_leader")
+    assert any(m.from_member_name == USER_PSEUDO_MEMBER_NAME for m in broadcasts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_human_agent_inbox_raises_when_hitt_off(team_backend, db):
+    await team_backend.build_team(
+        display_name="t",
+        desc="t",
+        leader_display_name="Leader",
+        leader_desc="p",
+        overrides=CapabilityOverrides(enable_hitt=False),
+    )
+    inbox = HumanAgentInbox(team_backend, team_backend.message_manager)
+    with pytest.raises(HumanAgentNotEnabledError):
+        await inbox.send("hi")
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_human_agent_inbox_sends_as_human_agent(built_team, db):
+    inbox = HumanAgentInbox(built_team, built_team.message_manager)
+    msg_id = await inbox.send("on it", to="team_leader")
+    assert msg_id is not None
+    stored = await built_team.message_manager.get_messages(to_member_name="team_leader")
+    assert any(m.from_member_name == HUMAN_AGENT_MEMBER_NAME for m in stored)
+
+
+# ---------------------------------------------------------------------------
+# Multiple human-agent members
+# ---------------------------------------------------------------------------
+
+
+def _multi_human_spec() -> TeamAgentSpec:
+    """Two distinct human members declared via predefined_members."""
+    agents = {"leader": DeepAgentSpec()}
+    return TeamAgentSpec(
+        agents=agents,
+        team_name="multi_hitt_team",
+        predefined_members=[
+            TeamMemberSpec(
+                member_name="human_designer",
+                display_name="Designer",
+                role_type=TeamRole.HUMAN_AGENT,
+                persona="Visual designer",
+            ),
+            TeamMemberSpec(
+                member_name="human_pm",
+                display_name="Product Manager",
+                role_type=TeamRole.HUMAN_AGENT,
+                persona="PM",
+            ),
+        ],
+    )
+
+
+@pytest.mark.level0
+def test_multi_human_spec_validates():
+    """Multiple role=HUMAN_AGENT members with custom names pass validation."""
+    spec = _multi_human_spec()
+    spec._validate_reserved_names()  # must not raise
+
+
+@pytest.mark.level0
+def test_multi_human_spec_with_enable_hitt_passes_consistency():
+    """Multi-human declaration validates fine; the framework no longer mutates the roster."""
+    spec = _multi_human_spec()
+    spec.enable_hitt = True
+    before = {m.member_name for m in spec.predefined_members}
+    spec._validate_hitt_consistency()
+    after = {m.member_name for m in spec.predefined_members}
+    assert after == before
+    # The default "human_agent" must NOT appear alongside the two customs.
+    assert HUMAN_AGENT_MEMBER_NAME not in after
+
+
+@pytest_asyncio.fixture
+async def multi_human_backend(db, messager):
+    backend = TeamBackend(
+        team_name="multi_hitt_team",
+        member_name="team_leader",
+        is_leader=True,
+        db=db,
+        messager=messager,
+        predefined_members=[
+            TeamMemberSpec(
+                member_name="human_designer",
+                display_name="Designer",
+                role_type=TeamRole.HUMAN_AGENT,
+                persona="Visual designer",
+            ),
+            TeamMemberSpec(
+                member_name="human_pm",
+                display_name="PM",
+                role_type=TeamRole.HUMAN_AGENT,
+                persona="Product",
+            ),
+        ],
+        enable_hitt=True,
+    )
+    await backend.build_team(
+        display_name="Multi",
+        desc="t",
+        leader_display_name="Leader",
+        leader_desc="p",
+    )
+    yield backend
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_registers_every_declared_human_member(multi_human_backend, db):
+    assert multi_human_backend.hitt_enabled() is True
+    assert await multi_human_backend.is_human_agent("human_designer") is True
+    assert await multi_human_backend.is_human_agent("human_pm") is True
+    assert await multi_human_backend.is_human_agent("team_leader") is False
+    # Both must be persisted as UNSTARTED members so the leader's
+    # standard startup sweep brings up a real DeepAgent for each.
+    for name in ("human_designer", "human_pm"):
+        member = await db.member.get_member(name, "multi_hitt_team")
+        assert member is not None
+        assert member.status == MemberStatus.UNSTARTED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_direct_message_to_every_human_member_stays_unread(multi_human_backend, db):
+    """send_message to any declared human member must stay unread on write."""
+    mm = multi_human_backend.message_manager
+    for name in ("human_designer", "human_pm"):
+        msg_id = await mm.send_message(content=f"hi {name}", to_member_name=name)
+        assert msg_id is not None
+        messages = await mm.get_messages(to_member_name=name)
+        assert not any(m.is_read for m in messages if m.to_member_name == name)
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_broadcast_to_every_human_member_stays_unread(
+    multi_human_backend,
+):
+    """Broadcast must remain unread for every human member on write."""
+    mm = multi_human_backend.message_manager
+    msg_id = await mm.broadcast_message(content="hello team")
+    assert msg_id is not None
+    for name in ("human_designer", "human_pm"):
+        unread = await mm.get_broadcast_messages(member_name=name, unread_only=True)
+        assert len(unread) == 1
+        assert unread[0].message_id == msg_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_task_lock_per_human_member(multi_human_backend, db):
+    """Each human member locks its own tasks; unrelated tasks stay mutable."""
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.team_tools import UpdateTaskTool
+
+    await _create_and_assign(multi_human_backend, db, "t-designer", "human_designer")
+    await _create_and_assign(multi_human_backend, db, "t-pm", "human_pm")
+    tool = UpdateTaskTool(multi_human_backend, make_translator("en"))
+
+    out_designer = await tool.invoke({"task_id": "t-designer", "status": "cancelled"})
+    assert out_designer.success is False
+    out_pm = await tool.invoke({"task_id": "t-pm", "assignee": "team_leader"})
+    assert out_pm.success is False
+
+    designer_task = await multi_human_backend.task_manager.get("t-designer")
+    pm_task = await multi_human_backend.task_manager.get("t-pm")
+    assert designer_task.assignee == "human_designer"
+    assert pm_task.assignee == "human_pm"
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_cancel_all_preserves_all_human_members(multi_human_backend, db):
+    """Batch cancel must preserve tasks held by ANY human member."""
+    from openjiuwen.agent_teams.tools.locales import make_translator
+    from openjiuwen.agent_teams.tools.team_tools import UpdateTaskTool
+
+    await _create_and_assign(multi_human_backend, db, "t-designer", "human_designer")
+    await _create_and_assign(multi_human_backend, db, "t-pm", "human_pm")
+    await multi_human_backend.task_manager.add(title="open", content="c", task_id="t-open")
+
+    tool = UpdateTaskTool(multi_human_backend, make_translator("en"))
+    out = await tool.invoke({"task_id": "*", "status": "cancelled"})
+    assert out.success is True
+
+    assert (await multi_human_backend.task_manager.get("t-designer")).status == TaskStatus.CLAIMED.value
+    assert (await multi_human_backend.task_manager.get("t-pm")).status == TaskStatus.CLAIMED.value
+    assert (await multi_human_backend.task_manager.get("t-open")).status == TaskStatus.CANCELLED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_human_agent_inbox_requires_sender_on_multi_team(multi_human_backend):
+    """Omitting sender is fine (defaults to first registered), but bogus
+    senders must raise UnknownHumanAgentError."""
+    from openjiuwen.agent_teams.interaction import UnknownHumanAgentError
+
+    inbox = HumanAgentInbox(multi_human_backend, multi_human_backend.message_manager)
+    with pytest.raises(UnknownHumanAgentError):
+        await inbox.send("spoofing", to="team_leader", sender="ghost")
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_human_agent_inbox_posts_under_chosen_sender(multi_human_backend):
+    """Explicit sender lets the caller speak as a specific human member."""
+    inbox = HumanAgentInbox(multi_human_backend, multi_human_backend.message_manager)
+    await inbox.send("ok", to="team_leader", sender="human_pm")
+    stored = await multi_human_backend.message_manager.get_messages(to_member_name="team_leader")
+    assert any(m.from_member_name == "human_pm" for m in stored)
+
+
+# ---------------------------------------------------------------------------
+# Rail HITT section
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.level0
+def test_hitt_section_none_when_no_human_members():
+    assert (
+        build_team_hitt_section(
+            role=TeamRole.LEADER,
+            human_agent_names=[],
+            language="cn",
+        )
+        is None
+    )
+
+
+@pytest.mark.level0
+def test_hitt_section_leader_mentions_lock_rules():
+    section = build_team_hitt_section(
+        role=TeamRole.LEADER,
+        human_agent_names=[HUMAN_AGENT_MEMBER_NAME],
+        language="cn",
+    )
+    assert section is not None
+    body = section.content["cn"]
+    assert HUMAN_AGENT_MEMBER_NAME in body
+    # Must spell out the ban on plain-text + the cancel/reassign lock.
+    assert "send_message" in body
+    assert "不能" in body or "禁止" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_human_agent_describes_constrained_tools():
+    section = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=[HUMAN_AGENT_MEMBER_NAME],
+        language="en",
+        self_member_name=HUMAN_AGENT_MEMBER_NAME,
+    )
+    assert section is not None
+    body = section.content["en"]
+    assert "send_message" in body
+    assert "claim_task" in body or "do not" in body.lower()
+
+
+@pytest.mark.level0
+def test_hitt_section_human_agent_send_message_is_user_driven_cn():
+    """human_agent has send_message, but the prompt must bind it to
+    user-issued relay instructions and forbid autonomous use."""
+    section = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=[HUMAN_AGENT_MEMBER_NAME],
+        language="cn",
+        self_member_name=HUMAN_AGENT_MEMBER_NAME,
+    )
+    assert section is not None
+    body = section.content["cn"]
+    # The avatar must have send_message available...
+    assert "有 `send_message`" in body
+    # ...but explicitly framed as a user-driven relay, with autonomous
+    # use prohibited.
+    assert "转发通道" in body or "转告" in body
+    assert "不允许" in body
+    # The old "no send_message" claim must not survive.
+    assert "没有 `send_message`" not in body
+
+
+@pytest.mark.level0
+def test_hitt_section_human_agent_send_message_is_user_driven_en():
+    """English mirror of the cn user-driven send_message constraint."""
+    section = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=[HUMAN_AGENT_MEMBER_NAME],
+        language="en",
+        self_member_name=HUMAN_AGENT_MEMBER_NAME,
+    )
+    assert section is not None
+    body = section.content["en"]
+    assert "do have `send_message`" in body
+    assert "user-driven" in body or "relay channel" in body
+    assert "Never" in body or "never" in body
+    assert "no `send_message`" not in body
+
+
+@pytest.mark.level0
+def test_hitt_section_leader_lists_every_human_member():
+    """Leader must see every registered human member name inline."""
+    section = build_team_hitt_section(
+        role=TeamRole.LEADER,
+        human_agent_names=["human_designer", "human_pm"],
+        language="cn",
+    )
+    assert section is not None
+    body = section.content["cn"]
+    assert "human_designer" in body
+    assert "human_pm" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_human_agent_tells_self_apart():
+    """Human-agent prompt names itself out of the roster."""
+    section = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=["human_designer", "human_pm"],
+        language="cn",
+        self_member_name="human_pm",
+    )
+    assert section is not None
+    body = section.content["cn"]
+    assert "human_pm" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_human_agent_strictly_forbids_autonomous_behavior_cn():
+    """Avatar prompt must spell out the strict prohibition on autonomous
+    replies and autonomous behavior when team event notifications land.
+
+    Regression guard: without the explicit "严格禁止" framing the avatar
+    LLM drifts into autonomous send_message / member_complete_task when
+    it sees something that looks reply-shaped or task-shaped in its input.
+    """
+    section = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=[HUMAN_AGENT_MEMBER_NAME],
+        language="cn",
+        self_member_name=HUMAN_AGENT_MEMBER_NAME,
+    )
+    assert section is not None
+    body = section.content["cn"]
+    # The XML notification tags must be named so the avatar recognises them.
+    assert '<team-inbound for="controller">' in body
+    assert 'kind="task-assigned"' in body
+    # Strict-prohibition keywords must appear: both autonomous replies
+    # and autonomous tool calls are forbidden until the controller
+    # explicitly instructs.
+    assert "严格禁止" in body
+    assert "send_message" in body
+    assert "member_complete_task" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_human_agent_strictly_forbids_autonomous_behavior_en():
+    """English mirror of the strict-prohibition guard."""
+    section = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=[HUMAN_AGENT_MEMBER_NAME],
+        language="en",
+        self_member_name=HUMAN_AGENT_MEMBER_NAME,
+    )
+    assert section is not None
+    body = section.content["en"]
+    assert '<team-inbound for="controller">' in body
+    assert 'kind="task-assigned"' in body
+    assert "strictly forbidden" in body
+    assert "send_message" in body
+    assert "member_complete_task" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_teammate_default_is_anonymous_cn():
+    """Default (expose_human_agents_to_teammates=False): teammate
+    must receive a HITT section that carries the collaboration
+    guidance but does NOT list any human_agent member_name and does
+    NOT use the "真实人类" label. Otherwise peer role (teammate vs
+    human_agent) would leak into the teammate's system prompt.
+    """
+    section = build_team_hitt_section(
+        role=TeamRole.TEAMMATE,
+        human_agent_names=["human_pm", "human_designer"],
+        language="cn",
+    )
+    assert section is not None
+    body = section.content["cn"]
+    # Anonymous variant carries the guidance.
+    assert "send_message" in body
+    # Roster must not leak: no concrete member_name, no "real humans" tag.
+    assert "human_pm" not in body
+    assert "human_designer" not in body
+    assert "真实人类" not in body
+    assert "下列人类成员" not in body
+
+
+@pytest.mark.level0
+def test_hitt_section_teammate_default_is_anonymous_en():
+    """English mirror of the teammate-default-anonymous guard."""
+    section = build_team_hitt_section(
+        role=TeamRole.TEAMMATE,
+        human_agent_names=["human_pm", "human_designer"],
+        language="en",
+    )
+    assert section is not None
+    body = section.content["en"]
+    assert "send_message" in body
+    assert "human_pm" not in body
+    assert "human_designer" not in body
+    assert "real humans" not in body.lower()
+    assert "the team includes the following human" not in body.lower()
+
+
+@pytest.mark.level0
+def test_hitt_section_teammate_with_expose_flag_lists_roster_cn():
+    """expose_human_agents_to_teammates=True restores the legacy
+    roster-exposing variant: every human_agent member_name is listed
+    inline and the "真实人类" label is back.
+    """
+    section = build_team_hitt_section(
+        role=TeamRole.TEAMMATE,
+        human_agent_names=["human_pm", "human_designer"],
+        language="cn",
+        expose_human_agents_to_teammates=True,
+    )
+    assert section is not None
+    body = section.content["cn"]
+    assert "human_pm" in body
+    assert "human_designer" in body
+    assert "真实人类" in body
+    assert "send_message" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_teammate_with_expose_flag_lists_roster_en():
+    """English mirror of the teammate-expose-flag-lists-roster guard."""
+    section = build_team_hitt_section(
+        role=TeamRole.TEAMMATE,
+        human_agent_names=["human_pm", "human_designer"],
+        language="en",
+        expose_human_agents_to_teammates=True,
+    )
+    assert section is not None
+    body = section.content["en"]
+    assert "human_pm" in body
+    assert "human_designer" in body
+    assert "real humans" in body.lower()
+    assert "send_message" in body
+
+
+@pytest.mark.level0
+def test_hitt_section_expose_flag_does_not_affect_leader_or_human_agent():
+    """The expose flag is teammate-only: leader and human_agent
+    branches must produce the same content with or without it.
+    """
+    leader_off = build_team_hitt_section(
+        role=TeamRole.LEADER,
+        human_agent_names=["human_pm"],
+        language="cn",
+        expose_human_agents_to_teammates=False,
+    )
+    leader_on = build_team_hitt_section(
+        role=TeamRole.LEADER,
+        human_agent_names=["human_pm"],
+        language="cn",
+        expose_human_agents_to_teammates=True,
+    )
+    assert leader_off is not None and leader_on is not None
+    assert leader_off.content["cn"] == leader_on.content["cn"]
+
+    human_off = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=["human_pm"],
+        language="cn",
+        self_member_name="human_pm",
+        expose_human_agents_to_teammates=False,
+    )
+    human_on = build_team_hitt_section(
+        role=TeamRole.HUMAN_AGENT,
+        human_agent_names=["human_pm"],
+        language="cn",
+        self_member_name="human_pm",
+        expose_human_agents_to_teammates=True,
+    )
+    assert human_off is not None and human_on is not None
+    assert human_off.content["cn"] == human_on.content["cn"]
+
+
+# ---------------------------------------------------------------------------
+# Reserved-name exports sanity
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.level0
+def test_reserved_member_names_set_content():
+    assert HUMAN_AGENT_MEMBER_NAME in RESERVED_MEMBER_NAMES
+    assert USER_PSEUDO_MEMBER_NAME in RESERVED_MEMBER_NAMES
+    assert "team_leader" in RESERVED_MEMBER_NAMES
+
+
+# ---------------------------------------------------------------------------
+# _resolve_team_mode — non-human predefined members derive "hybrid";
+# HUMAN_AGENT-only rosters stay "default"
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.level0
+def test_resolve_team_mode_default_when_no_predefined():
+    from openjiuwen.agent_teams.agent.agent_configurator import _resolve_team_mode
+
+    spec = _minimal_spec()
+    assert _resolve_team_mode(spec) == "default"
+
+
+@pytest.mark.level0
+def test_resolve_team_mode_ignores_human_agent_in_predefined():
+    """Predefined HUMAN_AGENT alone must NOT trigger predefined mode."""
+    from openjiuwen.agent_teams.agent.agent_configurator import _resolve_team_mode
+
+    pre = TeamMemberSpec(
+        member_name=HUMAN_AGENT_MEMBER_NAME,
+        display_name="H",
+        role_type=TeamRole.HUMAN_AGENT,
+        persona="x",
+    )
+    spec = _minimal_spec(enable_hitt=True, predefined_members=[pre])
+    assert _resolve_team_mode(spec) == "default"
+
+
+@pytest.mark.level0
+def test_resolve_team_mode_hybrid_when_non_human_member():
+    """A regular teammate in predefined_members derives hybrid mode."""
+    from openjiuwen.agent_teams.agent.agent_configurator import _resolve_team_mode
+
+    pre = TeamMemberSpec(
+        member_name="dev_1",
+        display_name="Dev",
+        role_type=TeamRole.TEAMMATE,
+        persona="x",
+    )
+    spec = _minimal_spec(predefined_members=[pre])
+    assert _resolve_team_mode(spec) == "hybrid"
+
+
+@pytest.mark.level0
+def test_resolve_team_mode_hybrid_with_mixed_roster():
+    """A mixed roster (human + teammate) still resolves to hybrid."""
+    from openjiuwen.agent_teams.agent.agent_configurator import _resolve_team_mode
+
+    spec = _minimal_spec(
+        enable_hitt=True,
+        predefined_members=[
+            TeamMemberSpec(
+                member_name=HUMAN_AGENT_MEMBER_NAME,
+                display_name="H",
+                role_type=TeamRole.HUMAN_AGENT,
+                persona="x",
+            ),
+            TeamMemberSpec(
+                member_name="dev_1",
+                display_name="Dev",
+                role_type=TeamRole.TEAMMATE,
+                persona="x",
+            ),
+        ],
+    )
+    assert _resolve_team_mode(spec) == "hybrid"
+
+
+@pytest.mark.level0
+def test_resolve_team_mode_explicit_predefined_overrides_derivation():
+    """An explicit team_mode is honored verbatim, never re-derived."""
+    from openjiuwen.agent_teams.agent.agent_configurator import _resolve_team_mode
+
+    pre = TeamMemberSpec(
+        member_name="dev_1",
+        display_name="Dev",
+        role_type=TeamRole.TEAMMATE,
+        persona="x",
+    )
+    spec = _minimal_spec(predefined_members=[pre], team_mode="predefined")
+    assert _resolve_team_mode(spec) == "predefined"
+
+
+# ---------------------------------------------------------------------------
+# hitt_enabled() now reflects the runtime effective flag (not the roster)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_hitt_enabled_reflects_capability_not_roster(db, messager):
+    """A backend with enable_hitt=True reports hitt_enabled=True even before any human is spawned."""
+    backend = TeamBackend(
+        team_name="cap_team",
+        member_name="team_leader",
+        is_leader=True,
+        db=db,
+        messager=messager,
+        enable_hitt=True,
+    )
+    assert backend.hitt_enabled() is True
+    assert await backend.human_agent_names() == frozenset()
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_hitt_enabled_false_when_capability_disabled(db, messager):
+    backend = TeamBackend(
+        team_name="cap_team_off",
+        member_name="team_leader",
+        is_leader=True,
+        db=db,
+        messager=messager,
+    )
+    assert backend.hitt_enabled() is False

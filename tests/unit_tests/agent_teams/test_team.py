@@ -1,0 +1,1472 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Unit tests for AgentTeam module"""
+
+from unittest.mock import (
+    AsyncMock,
+    patch,
+)
+
+import pytest
+import pytest_asyncio
+
+from openjiuwen.agent_teams.messager import Messager
+from openjiuwen.agent_teams.schema.team import (
+    TeamRuntimeContext,
+    TeamSpec,
+    TeamRole,
+)
+from openjiuwen.agent_teams.context import (
+    reset_session_id,
+    set_session_id,
+)
+from openjiuwen.agent_teams.tools.database import (
+    DatabaseConfig,
+    DatabaseType,
+    Team,
+    TeamDatabase,
+    TeamMember,
+)
+from openjiuwen.agent_teams.tools.memory_database import MemoryDatabaseConfig
+from openjiuwen.agent_teams.schema.status import (
+    ExecutionStatus,
+    MemberMode,
+    MemberStatus,
+    TaskStatus,
+)
+from openjiuwen.agent_teams.tools.team import (
+    TeamBackend,
+)
+from openjiuwen.agent_teams.schema.events import TeamEvent
+from openjiuwen.core.single_agent.schema.agent_card import AgentCard
+
+
+@pytest.fixture
+def db_config():
+    """Provide in-memory database config for testing"""
+    return DatabaseConfig(db_type=DatabaseType.SQLITE, connection_string=":memory:")
+
+
+@pytest_asyncio.fixture
+async def db(db_config):
+    """Provide initialized database instance"""
+    token = set_session_id("session_id")
+    database = TeamDatabase(db_config)
+    try:
+        await database.initialize()
+        yield database
+    finally:
+        reset_session_id(token)
+        await database.close()
+
+
+@pytest_asyncio.fixture
+async def message_bus():
+    """Provide Messager mock instance for testing"""
+    bus = AsyncMock(spec=Messager)
+    yield bus
+
+
+@pytest_asyncio.fixture
+async def agent_team(db, message_bus):
+    """Provide initialized AgentTeam instance"""
+    team_id = "test_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="Test Team",
+        leader_member_name="leader1"
+    )
+    return TeamBackend(
+        team_name=team_id,
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True
+    )
+
+
+@pytest.fixture
+def sample_agent_card():
+    """Provide sample AgentCard for testing"""
+    return AgentCard(
+        name="TestAgent",
+        description="A test agent",
+        version="1.0.0"
+    )
+
+
+class TestAgentTeamInit:
+    """Test AgentTeam initialization"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_agent_team_init(self, agent_team):
+        """Test AgentTeam initialization"""
+        assert agent_team.team_name == "test_team"
+        assert agent_team.member_name == "leader1"
+        assert agent_team.task_manager is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_agent_team_with_optional_fields(self, db, message_bus):
+        """Test AgentTeam with optional description and prompt"""
+        await db.team.create_team(
+            team_name="team_with_optional",
+            display_name="Optional Team",
+            leader_member_name="leader1",
+            desc="Team description",
+            prompt="Team prompt"
+        )
+        team = TeamBackend(
+            team_name="team_with_optional",
+            member_name="leader1",
+            db=db,
+            messager=message_bus,
+            is_leader=True
+        )
+
+        team_info = await team.get_team_info()
+        assert team_info.desc == "Team description"
+        assert team_info.prompt == "Team prompt"
+
+
+class TestSpawnMember:
+    """Test spawn_member functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_spawn_member_success(self, agent_team, sample_agent_card):
+        """Test spawning a member successfully"""
+        result = await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            desc="Test member",
+            prompt="Member prompt"
+        )
+
+        assert result.ok
+        assert await agent_team.get_member("member1")
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_spawn_member_creates_in_database(self, agent_team, sample_agent_card, db):
+        """Test that spawn_member creates member in database"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+
+        member = await db.member.get_member("member1", "test_team")
+        assert member is not None
+        assert member.member_name == "member1"
+        assert member.display_name == "Member One"
+        assert member.team_name == "test_team"
+        assert member.status == MemberStatus.UNSTARTED.value
+        assert member.execution_status == ExecutionStatus.IDLE.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_spawn_member_multiple(self, agent_team, sample_agent_card):
+        """Test spawning multiple members"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        await agent_team.spawn_member(
+            member_name="member2",
+            display_name="Member Two",
+            agent_card=sample_agent_card
+        )
+
+        members = await agent_team.list_members()
+        assert len(members) == 2
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_spawn_member_duplicate_returns_reason(self, agent_team, sample_agent_card):
+        """Spawning a member that already exists should report the collision."""
+        first = await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+        )
+        assert first.ok
+
+        second = await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Duplicate",
+            agent_card=sample_agent_card,
+        )
+        assert not second.ok
+        assert "member1" in second.reason
+        assert "already exists" in second.reason
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_spawn_member_with_minimal_args(self, agent_team, sample_agent_card):
+        """Test spawning member with minimal arguments"""
+        result = await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+
+        assert result.ok
+        members = await agent_team.list_members()
+        assert len(members) == 1
+        assert "member1" == members[0].member_name
+
+
+class TestApprovePlan:
+    """Test approve_plan functionality"""
+
+    @staticmethod
+    async def _submit_member_plan(agent_team, member_name: str = "member1"):
+        from openjiuwen.agent_teams.tools.task_manager import TeamTaskManager
+
+        task = await agent_team.task_manager.add(title="Plan task", content="Do work")
+        assert task.ok
+        assign_result = await agent_team.task_manager.assign(task.task_id, member_name)
+        assert assign_result.ok
+        member_task_manager = TeamTaskManager(
+            team_name=agent_team.team_name,
+            member_name=member_name,
+            db=agent_team.db,
+            messager=agent_team.messager,
+            plans_dir=agent_team.task_manager.plans_dir,
+            team_plan_id=agent_team.task_manager.team_plan_id,
+        )
+        plan_path = agent_team.task_manager.plans_dir / "draft-plan.md"
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text("1. inspect\n2. implement\n", encoding="utf-8")
+        submit_result = await member_task_manager.submit_plan(
+            task.task_id,
+            plan_path=str(plan_path),
+        )
+        assert submit_result["success"] is True
+        return task, submit_result["plan_id"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_approve_plan_success(self, agent_team, sample_agent_card):
+        """Test approving a plan successfully"""
+        # Create a member first
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            mode=MemberMode.PLAN_MODE,
+        )
+        task, plan_id = await self._submit_member_plan(agent_team)
+
+        # Approve plan
+        result = await agent_team.approve_plan(
+            plan_id=plan_id,
+            approved=True,
+            feedback="Plan looks good"
+        )
+
+        assert result is True
+        approved_task = await agent_team.task_manager.get(task.task_id)
+        assert approved_task.status == TaskStatus.PLAN_APPROVED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_approve_plan_uses_task_event_without_duplicate_message(self, agent_team, sample_agent_card):
+        """Test that approve_plan relies on task events instead of duplicate direct messages."""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            mode=MemberMode.PLAN_MODE,
+        )
+        _, plan_id = await self._submit_member_plan(agent_team)
+
+        with patch.object(agent_team.message_manager, 'send_message', new_callable=AsyncMock,
+                          return_value="msg123") as mock_send:
+            result = await agent_team.approve_plan(
+                plan_id=plan_id,
+                approved=True,
+                feedback="Great plan!"
+            )
+
+            assert result is True
+            mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_reject_plan_uses_task_event_without_duplicate_message(self, agent_team, sample_agent_card):
+        """Test that rejecting a plan relies on task events instead of duplicate direct messages."""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            mode=MemberMode.PLAN_MODE,
+        )
+        task, plan_id = await self._submit_member_plan(agent_team)
+
+        with patch.object(agent_team.message_manager, 'send_message', new_callable=AsyncMock,
+                          return_value="msg123") as mock_send:
+            result = await agent_team.approve_plan(
+                plan_id=plan_id,
+                approved=False,
+                feedback="Please revise"
+            )
+
+            assert result is True
+            mock_send.assert_not_called()
+            rejected_task = await agent_team.task_manager.get(task.task_id)
+            assert rejected_task.status == TaskStatus.CLAIMED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_approve_plan_missing_plan(self, agent_team):
+        """Test approving a non-existent plan."""
+        result = await agent_team.approve_plan(
+            plan_id="missing-plan",
+            approved=True
+        )
+
+        assert result is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_approve_plan_without_feedback(self, agent_team, sample_agent_card):
+        """Test approving plan without feedback"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            mode=MemberMode.PLAN_MODE,
+        )
+        task, plan_id = await self._submit_member_plan(agent_team)
+
+        with patch.object(agent_team.message_manager, 'send_message', new_callable=AsyncMock,
+                          return_value="msg123") as mock_send:
+            result = await agent_team.approve_plan(
+                plan_id=plan_id,
+                approved=True
+            )
+
+            assert result is True
+            mock_send.assert_not_called()
+            approved_task = await agent_team.task_manager.get(task.task_id)
+            assert approved_task.status == TaskStatus.PLAN_APPROVED.value
+
+
+class TestApproveTool:
+    """Test approve_tool functionality."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_approve_tool_success(self, agent_team, sample_agent_card):
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+        )
+
+        result = await agent_team.approve_tool(
+            member_name="member1",
+            tool_call_id="call-1",
+            approved=True,
+            feedback="Looks safe",
+            auto_confirm=True,
+        )
+
+        assert result is True
+        agent_team.messager.publish.assert_awaited()
+        published_message = agent_team.messager.publish.await_args.kwargs["message"]
+        assert published_message.event_type == TeamEvent.TOOL_APPROVAL_RESULT
+        assert published_message.payload["member_name"] == "member1"
+        assert published_message.payload["tool_call_id"] == "call-1"
+        assert published_message.payload["approved"] is True
+        assert published_message.payload["auto_confirm"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_approve_tool_member_not_found(self, agent_team):
+        result = await agent_team.approve_tool(
+            member_name="missing",
+            tool_call_id="call-1",
+            approved=False,
+        )
+
+        assert result is False
+
+
+class TestShutdownMember:
+    """Test shutdown_member functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level0
+    async def test_shutdown_member_success(self, agent_team, sample_agent_card, db):
+        """Test shutting downser successfully"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            status=MemberStatus.READY
+        )
+
+        result = await agent_team.shutdown_member(member_name="member1", force=False)
+
+        assert result.ok
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_shutdown_member_updates_status(self, agent_team, sample_agent_card, db):
+        """Test that shutdown_member updates member status"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            status=MemberStatus.READY
+        )
+
+        await agent_team.shutdown_member(member_name="member1")
+
+        member = await db.member.get_member("member1", "test_team")
+        assert member.status == MemberStatus.SHUTDOWN_REQUESTED.value
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_shutdown_member_already_shutdown(self, agent_team, sample_agent_card, db):
+        """Test shutting down an already shutdown member"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            status=MemberStatus.READY
+        )
+
+        # First shutdown
+        await agent_team.shutdown_member(member_name="member1")
+        await db.member.update_member_status("member1", "team1", MemberStatus.SHUTDOWN.value)
+
+        # Try to shutdown again
+        result = await agent_team.shutdown_member(member_name="member1")
+        assert result.ok
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_shutdown_member_not_found(self, agent_team):
+        """Test shutting down non-existent member surfaces the reason."""
+        result = await agent_team.shutdown_member(member_name="nonexistent_member")
+        assert not result.ok
+        assert "not found" in result.reason
+
+
+class TestCancelMember:
+    """Test cancel_member functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_member_success(self, agent_team, sample_agent_card, db):
+        """Test cancelling a member execution successfully"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+
+        result = await agent_team.cancel_member(member_name="member1")
+
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_member_when_busy(self, agent_team, sample_agent_card, db):
+        """Test cancelling a busy member"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        # Set member to busy
+        await db.member.update_member_status("member1", "team1", MemberStatus.BUSY.value)
+
+        result = await agent_team.cancel_member(member_name="member1")
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_member_when_not_busy(self, agent_team, sample_agent_card, db):
+        """Test cancelling a non-busy member returns True (no-op)"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        # Set member to ready (not busy)
+        await db.member.update_member_status("member1", "team1", MemberStatus.READY.value)
+
+        result = await agent_team.cancel_member(member_name="member1")
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_member_not_found(self, agent_team):
+        """Test cancelling non-existent member"""
+        result = await agent_team.cancel_member(member_name="nonexistent_member")
+        assert result is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_member_resets_claimed_tasks(self, agent_team, sample_agent_card, db, message_bus):
+        """Test that cancelling a member resets their claimed tasks"""
+        from openjiuwen.agent_teams.tools.task_manager import TeamTaskManager
+
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            status=MemberStatus.BUSY,
+            mode=MemberMode.BUILD_MODE,
+        )
+
+        # Create member1's task_manager
+        member1_task_manager = TeamTaskManager(
+            team_name="test_team",
+            member_name="member1",
+            db=db,
+            messager=message_bus
+        )
+
+        # Create and claim tasks for the member using member1's task_manager
+        task1 = await member1_task_manager.add(title="Task 1", content="Content 1")
+        task2 = await member1_task_manager.add(title="Task 2", content="Content 2")
+        task3 = await member1_task_manager.add(title="Task 3", content="Content 3")
+
+        await member1_task_manager.claim(task1.task_id)
+        await member1_task_manager.claim(task2.task_id)
+        # task3 remains unclaimed
+
+        # Verify tasks are claimed
+        task1_claimed = await db.task.get_task(task1.task_id)
+        task2_claimed = await db.task.get_task(task2.task_id)
+        assert task1_claimed.status == TaskStatus.CLAIMED.value
+        assert task2_claimed.status == TaskStatus.CLAIMED.value
+        assert task1_claimed.assignee == "member1"
+        assert task2_claimed.assignee == "member1"
+
+        # Cancel member
+        result = await agent_team.cancel_member(member_name="member1")
+        assert result is True
+
+        # Verify claimed tasks are reset to PENDING
+        task1_reset = await db.task.get_task(task1.task_id)
+        task2_reset = await db.task.get_task(task2.task_id)
+        assert task1_reset.status == TaskStatus.PENDING.value
+        assert task2_reset.status == TaskStatus.PENDING.value
+        assert task1_reset.assignee is None
+        assert task2_reset.assignee is None
+
+        # Verify unclaimed task remains unchanged
+        task3_unchanged = await db.task.get_task(task3.task_id)
+        assert task3_unchanged.status == TaskStatus.PENDING.value
+        assert task3_unchanged.assignee is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_member_no_claimed_tasks(self, agent_team, sample_agent_card, db):
+        """Test cancelling a member with no claimed tasks"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            status=MemberStatus.BUSY
+        )
+
+        # Create tasks but don't claim them
+        task1 = await agent_team.task_manager.add(title="Task 1", content="Content 1")
+        task2 = await agent_team.task_manager.add(title="Task 2", content="Content 2")
+
+        # Cancel member
+        result = await agent_team.cancel_member(member_name="member1")
+        assert result is True
+
+        # Verify tasks remain pending with no assignee
+        task1_after = await db.task.get_task(task1.task_id)
+        task2_after = await db.task.get_task(task2.task_id)
+        assert task1_after.status == TaskStatus.PENDING.value
+        assert task2_after.status == TaskStatus.PENDING.value
+        assert task1_after.assignee is None
+        assert task2_after.assignee is None
+
+
+class TestCleanTeam:
+    """Test clean_team functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_clean_team_success(self, agent_team, sample_agent_card, db):
+        """Test cleaning up a team successfully"""
+        # Create members
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        await agent_team.spawn_member(
+            member_name="member2",
+            display_name="Member Two",
+            agent_card=sample_agent_card
+        )
+
+        # Shutdown all members
+        await db.member.update_member_status("member1", "test_team", MemberStatus.SHUTDOWN_REQUESTED.value)
+        await db.member.update_member_status("member1", "test_team", MemberStatus.SHUTDOWN.value)
+        await db.member.update_member_status("member2", "test_team", MemberStatus.SHUTDOWN_REQUESTED.value)
+        await db.member.update_member_status("member2", "test_team", MemberStatus.SHUTDOWN.value)
+
+        result = await agent_team.clean_team()
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_clean_team_fails_when_members_not_shutdown(self, agent_team, sample_agent_card, db):
+        """Test that clean_team fails when members are not shutdown"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        # Member is not shut down (status is BUSY)
+
+        result = await agent_team.clean_team()
+        assert result is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_clean_team_partial_shutdown(self, agent_team, sample_agent_card, db):
+        """Test clean_team when only some members are shutdown"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        await agent_team.spawn_member(
+            member_name="member2",
+            display_name="Member Two",
+            agent_card=sample_agent_card
+        )
+
+        # Only shutdown one member
+        await db.member.update_member_status("member1", "team1", MemberStatus.SHUTDOWN.value)
+
+        result = await agent_team.clean_team()
+        assert result is False
+
+
+class TestGetMember:
+    """Test get_member functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_member_success(self, agent_team, sample_agent_card, db):
+        """Test getting a member successfully"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card,
+            desc="Test description"
+        )
+
+        member = await agent_team.get_member("member1")
+
+        assert member is not None
+        assert member.member_name == "member1"
+        assert member.display_name == "Member One"
+        assert member.team_name == "test_team"
+        assert isinstance(member, TeamMember)
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_member_not_found(self, agent_team):
+        """Test getting non-existent member"""
+        member = await agent_team.get_member("nonexistent_member")
+        assert member is None
+
+
+class TestListMembers:
+    """Test list_members functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_list_members_empty(self, agent_team):
+        """Test listing members when none exist"""
+        members = await agent_team.list_members()
+        assert members == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_list_members_with_members(self, agent_team, sample_agent_card):
+        """Test listing members when they exist"""
+        await agent_team.spawn_member(
+            member_name="member1",
+            display_name="Member One",
+            agent_card=sample_agent_card
+        )
+        await agent_team.spawn_member(
+            member_name="member2",
+            display_name="Member Two",
+            agent_card=sample_agent_card
+        )
+
+        members = await agent_team.list_members()
+
+        assert len(members) == 2
+        member_ids = [m.member_name for m in members]
+        assert "member1" in member_ids
+        assert "member2" in member_ids
+        assert all(isinstance(m, TeamMember) for m in members)
+
+
+class TestGetTeamInfo:
+    """Test get_team_info functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_team_info_success(self, agent_team):
+        """Test getting team info successfully"""
+        team_info = await agent_team.get_team_info()
+
+        assert team_info is not None
+        assert team_info.team_name == "test_team"
+        assert team_info.display_name == "Test Team"
+        assert team_info.leader_member_name == "leader1"
+        assert isinstance(team_info, Team)
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_team_info_with_optional_fields(self, db, message_bus):
+        """Test getting team info with optional fields"""
+        await db.team.create_team(
+            team_name="full_team",
+            display_name="Full Team",
+            leader_member_name="leader1",
+            desc="Full description",
+            prompt="Full prompt"
+        )
+
+        team = TeamBackend(
+            team_name="full_team",
+            member_name="leader1",
+            db=db,
+            messager=message_bus,
+            is_leader=True
+        )
+
+        team_info = await team.get_team_info()
+
+        assert team_info is not None
+        assert team_info.team_name == "full_team"
+        assert team_info.display_name == "Full Team"
+        assert team_info.leader_member_name == "leader1"
+        assert team_info.desc == "Full description"
+        assert team_info.prompt == "Full prompt"
+        assert team_info.created is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_get_team_info_not_found(self, db, message_bus):
+        """Test getting info for non-existent team"""
+        team = TeamBackend(
+            team_name="nonexistent_team",
+            member_name="leader1",
+            db=db,
+            messager=message_bus,
+            is_leader=True
+        )
+
+        team_info = await team.get_team_info()
+        # Note: get_team_info uses db.get_team which returns None if not found
+        assert team_info is None
+
+
+class TestCancelTask:
+    """Test cancel_task functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_task_success(self, agent_team, db):
+        """Test cancelling a task successfully"""
+        # Create a task
+        await db.task.create_task(
+            task_id="task1",
+            team_name="test_team",
+            title="Test Task",
+            content="Task content",
+            status="pending"
+        )
+
+        result = await agent_team.cancel_task(task_id="task1")
+
+        assert result is True
+        # Verify task is cancelled
+        task = await db.task.get_task("task1")
+        assert task.status == "cancelled"
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_task_not_found(self, agent_team):
+        """Test cancelling a non-existent task"""
+        result = await agent_team.cancel_task(task_id="nonexistent_task")
+        assert result is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_task_already_cancelled(self, agent_team, db):
+        """Test cancelling an already cancelled task"""
+        # Create and cancel a task
+        await db.task.create_task(
+            task_id="task1",
+            team_name="test_team",
+            title="Test Task",
+            content="Task content",
+            status="pending"
+        )
+        await db.task.update_task_status("task1", "cancelled")
+
+        # Try to cancel again
+        result = await agent_team.cancel_task(task_id="task1")
+        assert result is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_task_with_assignee_sends_notification(self, agent_team, db):
+        """Test cancelling a claimed task sends notification to assignee"""
+        # Create a task and claim it
+        await db.task.create_task(
+            task_id="task1",
+            team_name="test_team",
+            title="Test Task",
+            content="Task content",
+            status="pending"
+        )
+        await db.task.claim_task(task_id="task1", member_name="member1")
+
+        result = await agent_team.cancel_task(task_id="task1")
+
+        assert result is True
+
+        # Verify notification message was sent via database
+        messages = await db.message.get_messages(team_name="test_team", to_member_name="member1")
+        assert len(messages) == 1
+        message = messages[0]
+        assert "cancelled" in message.content.lower()
+        assert "Test Task" in message.content
+        assert message.from_member_name == "leader1"
+        assert message.to_member_name == "member1"
+        assert message.broadcast is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_task_without_assignee_no_notification(self, agent_team, db):
+        """Test cancelling an unclaimed task doesn't send notification"""
+        # Create an unclaimed task
+        await db.task.create_task(
+            task_id="task1",
+            team_name="test_team",
+            title="Test Task",
+            content="Task content",
+            status="pending"
+        )
+
+        result = await agent_team.cancel_task(task_id="task1")
+
+        assert result is True
+
+        # Verify no notification message was sent
+        messages = await db.message.get_team_messages(team_name="test_team", broadcast=False)
+        cancel_notifications = [m for m in messages if "cancelled" in m["content"].lower()]
+        assert len(cancel_notifications) == 0
+
+
+class TestCancelAllTasks:
+    """Test cancel_all_tasks functionality"""
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_tasks_success(self, agent_team, db):
+        """Test cancelling all tasks successfully"""
+        # Create multiple tasks
+        await db.task.create_task("task1", "test_team", "Task 1", "Content 1", "pending")
+        await db.task.create_task("task2", "test_team", "Task 2", "Content 2", "pending")
+        await db.task.create_task("task3", "test_team", "Task 3", "Content 3", "pending")
+
+        # Cancel all tasks
+        count = await agent_team.cancel_all_tasks()
+
+        assert count == 3
+
+        # Verify all tasks are cancelled
+        task1 = await db.task.get_task("task1")
+        task2 = await db.task.get_task("task2")
+        task3 = await db.task.get_task("task3")
+        assert task1.status == "cancelled"
+        assert task2.status == "cancelled"
+        assert task3.status == "cancelled"
+
+        # Verify broadcast message was sent
+        messages = await db.message.get_team_messages(team_name="test_team", broadcast=True)
+        assert len(messages) == 1
+        assert "All tasks (3) have been cancelled" in messages[0].content
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_tasks_mixed_status(self, agent_team, db):
+        """Test cancelling tasks with mixed statuses"""
+        # Create tasks with different statuses
+        await db.task.create_task("task1", "test_team", "Task 1", "Content 1", "pending")
+        await db.task.create_task("task2", "test_team", "Task 2", "Content 2", "claimed")
+        await db.task.claim_task("task2", "member1")
+        await db.task.create_task("task3", "test_team", "Task 3", "Content 3", "cancelled")
+        await db.task.create_task("task4", "test_team", "Task 4", "Content 4", "completed")
+
+        # Cancel all tasks
+        count = await agent_team.cancel_all_tasks()
+
+        # Only pending and claimed tasks should be cancelled (2 tasks)
+        assert count == 2
+
+        # Verify
+        task1 = await db.task.get_task("task1")
+        task2 = await db.task.get_task("task2")
+        task3 = await db.task.get_task("task3")
+        task4 = await db.task.get_task("task4")
+        assert task1.status == "cancelled"
+        assert task2.status == "cancelled"
+        assert task3.status == "cancelled"  # Stays cancelled
+        assert task4.status == "completed"  # Stays completed
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_tasks_no_active_tasks(self, agent_team, db):
+        """Test cancelling when no active tasks"""
+        # Only have cancelled and completed tasks
+        await db.task.create_task("task1", "test_team", "Task 1", "Content 1", "cancelled")
+        await db.task.create_task("task2", "test_team", "Task 2", "Content 2", "completed")
+
+        # Cancel all tasks
+        count = await agent_team.cancel_all_tasks()
+
+        assert count == 0
+
+        # Verify no broadcast message was sent
+        messages = await db.message.get_team_messages(team_name="test_team", broadcast=True)
+        assert len(messages) == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.level1
+    async def test_cancel_all_tasks_empty_team(self, agent_team):
+        """Test cancelling when team has no tasks"""
+        count = await agent_team.cancel_all_tasks()
+        assert count == 0
+
+
+class TestTeamRuntimeContextDbConfig:
+    """Test TeamRuntimeContext accepts both DatabaseConfig and MemoryDatabaseConfig."""
+
+    @pytest.mark.level0
+    def test_runtime_context_with_database_config(self):
+        """Test TeamRuntimeContext accepts DatabaseConfig."""
+        db_config = DatabaseConfig(
+            db_type=DatabaseType.SQLITE,
+            connection_string=":memory:",
+        )
+        context = TeamRuntimeContext(
+            role=TeamRole.LEADER,
+            member_name="leader1",
+            team_spec=TeamSpec(team_name="test_team", display_name="Test Team"),
+            db_config=db_config,
+        )
+        assert context.db_config.db_type == "sqlite"
+
+    @pytest.mark.level0
+    def test_runtime_context_with_memory_database_config(self):
+        """Test TeamRuntimeContext accepts MemoryDatabaseConfig."""
+        db_config = MemoryDatabaseConfig()
+        context = TeamRuntimeContext(
+            role=TeamRole.LEADER,
+            member_name="leader1",
+            team_spec=TeamSpec(team_name="test_team", display_name="Test Team"),
+            db_config=db_config,
+        )
+        assert context.db_config.db_type == "memory"
+
+    @pytest.mark.level0
+    def test_runtime_context_default_database_config(self):
+        """Test TeamRuntimeContext defaults to DatabaseConfig."""
+        context = TeamRuntimeContext(
+            role=TeamRole.LEADER,
+            member_name="leader1",
+            team_spec=TeamSpec(team_name="test_team", display_name="Test Team"),
+        )
+        assert isinstance(context.db_config, DatabaseConfig)
+        assert context.db_config.db_type == DatabaseType.SQLITE
+
+
+async def _seed_member(db: TeamDatabase, member_name: str, status: str) -> None:
+    """Insert a team_member row for the 'test_team' fixture team."""
+    await db.member.create_member(
+        member_name=member_name,
+        team_name="test_team",
+        display_name=member_name,
+        agent_card=AgentCard().model_dump_json(),
+        status=status,
+        mode=MemberMode.BUILD_MODE.value,
+    )
+
+
+async def _drain_one_task(agent_team: TeamBackend) -> None:
+    """Add a single task and drive it to a terminal (completed) status."""
+    task = await agent_team.task_manager.add(title="T", content="c")
+    assert await agent_team.task_manager.claim(task.task_id)
+    await agent_team.task_manager.complete(task.task_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_is_team_completed_all_conditions_met(agent_team, db):
+    """All members settled + all tasks terminal + no unread → snapshot returned."""
+    await _seed_member(db, "leader1", MemberStatus.READY.value)
+    await _seed_member(db, "member1", MemberStatus.READY.value)
+    await _drain_one_task(agent_team)
+
+    snapshot = await agent_team.is_team_completed()
+
+    assert snapshot is not None
+    assert snapshot.member_count == 2
+    assert snapshot.task_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_is_team_completed_member_busy_returns_none(agent_team, db):
+    """A non-leader member still BUSY blocks completion."""
+    await _seed_member(db, "leader1", MemberStatus.READY.value)
+    await _seed_member(db, "member1", MemberStatus.BUSY.value)
+    await _drain_one_task(agent_team)
+
+    assert await agent_team.is_team_completed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_is_team_completed_leader_busy_returns_none(agent_team, db):
+    """The leader counts as a member — a busy leader blocks completion."""
+    await _seed_member(db, "leader1", MemberStatus.BUSY.value)
+    await _seed_member(db, "member1", MemberStatus.READY.value)
+    await _drain_one_task(agent_team)
+
+    assert await agent_team.is_team_completed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_is_team_completed_pending_task_returns_none(agent_team, db):
+    """A non-terminal task blocks completion."""
+    await _seed_member(db, "leader1", MemberStatus.READY.value)
+    await _seed_member(db, "member1", MemberStatus.READY.value)
+    await agent_team.task_manager.add(title="T", content="c")
+
+    assert await agent_team.is_team_completed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_is_team_completed_empty_task_list_returns_none(agent_team, db):
+    """An empty task board is not a completed team."""
+    await _seed_member(db, "leader1", MemberStatus.READY.value)
+    await _seed_member(db, "member1", MemberStatus.READY.value)
+
+    assert await agent_team.is_team_completed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_is_team_completed_unread_message_returns_none(agent_team, db):
+    """An unread message blocks completion even when members and tasks are settled."""
+    await _seed_member(db, "leader1", MemberStatus.READY.value)
+    await _seed_member(db, "member1", MemberStatus.READY.value)
+    await _drain_one_task(agent_team)
+    await agent_team.message_manager.send_message(content="ping", to_member_name="member1")
+
+    assert await agent_team.is_team_completed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_is_team_completed_blocks_on_unread_broadcast(agent_team, db):
+    """A pending broadcast blocks completion: any unread message gates conclusion."""
+    await _seed_member(db, "leader1", MemberStatus.READY.value)
+    await _seed_member(db, "member1", MemberStatus.READY.value)
+    await _drain_one_task(agent_team)
+    await agent_team.message_manager.broadcast_message(content="announce")
+
+    assert await agent_team.is_team_completed() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_clean_team_fires_callback_on_success(db, message_bus):
+    """clean_team runs on_team_cleaned exactly once on the success path."""
+    await db.team.create_team(
+        team_name="cb_team",
+        display_name="Callback Team",
+        leader_member_name="leader1",
+    )
+    calls: list[int] = []
+
+    async def _on_cleaned() -> None:
+        calls.append(1)
+
+    backend = TeamBackend(
+        team_name="cb_team",
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+        on_team_cleaned=_on_cleaned,
+    )
+
+    result = await backend.clean_team()
+
+    assert result is True
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_build_team_fires_callback_on_success(db, message_bus):
+    """build_team runs on_team_built exactly once on the success path."""
+    calls: list[int] = []
+
+    async def _on_built() -> None:
+        calls.append(1)
+
+    backend = TeamBackend(
+        team_name="build_cb_team",
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+        on_team_built=_on_built,
+    )
+
+    await backend.build_team(
+        display_name="Build Callback Team",
+        desc="Callback Team",
+        leader_display_name="Leader",
+        leader_desc="Leader persona",
+    )
+
+    assert calls == [1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_clean_team_skips_callback_on_failure(db, message_bus, sample_agent_card):
+    """clean_team must NOT fire on_team_cleaned when members are still active."""
+    await db.team.create_team(
+        team_name="cb_fail_team",
+        display_name="Callback Fail Team",
+        leader_member_name="leader1",
+    )
+    calls: list[int] = []
+
+    async def _on_cleaned() -> None:
+        calls.append(1)
+
+    backend = TeamBackend(
+        team_name="cb_fail_team",
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+        on_team_cleaned=_on_cleaned,
+    )
+    # Spawn a member left in a non-SHUTDOWN status so clean_team bails out.
+    await backend.spawn_member(
+        member_name="member1",
+        display_name="Member One",
+        agent_card=sample_agent_card,
+    )
+
+    result = await backend.clean_team()
+
+    assert result is False
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_clean_team_callback_failure_does_not_break_clean(db, message_bus):
+    """A raising on_team_cleaned is swallowed; clean_team still succeeds."""
+    await db.team.create_team(
+        team_name="cb_raise_team",
+        display_name="Callback Raise Team",
+        leader_member_name="leader1",
+    )
+
+    async def _on_cleaned() -> None:
+        raise RuntimeError("boom")
+
+    backend = TeamBackend(
+        team_name="cb_raise_team",
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+        on_team_cleaned=_on_cleaned,
+    )
+
+    result = await backend.clean_team()
+
+    assert result is True
+    assert await backend.get_team_info() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_clean_team_before_callback_failure_aborts_clean(db, message_bus):
+    """A raising on_before_team_cleaned keeps DB rows so cleanup can be retried."""
+    await db.team.create_team(
+        team_name="cb_before_raise_team",
+        display_name="Before Callback Raise Team",
+        leader_member_name="leader1",
+    )
+    cleaned_calls: list[int] = []
+
+    async def _on_before_cleaned() -> None:
+        raise RuntimeError("boom")
+
+    async def _on_cleaned() -> None:
+        cleaned_calls.append(1)
+
+    backend = TeamBackend(
+        team_name="cb_before_raise_team",
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+        on_before_team_cleaned=_on_before_cleaned,
+        on_team_cleaned=_on_cleaned,
+    )
+
+    result = await backend.clean_team()
+
+    assert result is False
+    assert cleaned_calls == []
+    assert await backend.get_team_info() is not None
+
+
+@pytest.mark.asyncio
+@pytest.mark.level1
+async def test_clean_team_no_callback_is_noop(db, message_bus):
+    """clean_team success path works when on_team_cleaned is not wired."""
+    await db.team.create_team(
+        team_name="no_cb_team",
+        display_name="No Callback Team",
+        leader_member_name="leader1",
+    )
+    backend = TeamBackend(
+        team_name="no_cb_team",
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+    )
+
+    assert await backend.clean_team() is True
+
+
+# ----------------------------------------------------------------------
+# startup_member / startup / try_transition_member_status
+# ----------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_startup_member_transitions_to_starting_then_spawns(db, message_bus):
+    """startup_member atomically transitions UNSTARTED→STARTING and spawns."""
+    team_id = "startup_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="Startup Team",
+        leader_member_name="leader1",
+    )
+    backend = TeamBackend(
+        team_name=team_id,
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+    )
+    card = AgentCard(name="Dev1", description="dev 1", version="1.0.0")
+    await backend.spawn_member(member_name="dev-1", display_name="Dev 1", agent_card=card)
+
+    on_created = AsyncMock()
+    result = await backend.startup_member("dev-1", on_created=on_created)
+
+    assert result is True
+    on_created.assert_awaited_once_with("dev-1")
+    member = await db.member.get_member("dev-1", team_id)
+    # STARTING state; agent process will later transition to READY.
+    assert member.status == MemberStatus.STARTING.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_startup_member_returns_false_if_not_unstarted(db, message_bus):
+    """startup_member skips members that are not UNSTARTED."""
+    team_id = "skip_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="Skip Team",
+        leader_member_name="leader1",
+    )
+    backend = TeamBackend(
+        team_name=team_id,
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+    )
+    card = AgentCard(name="Dev1", description="dev 1", version="1.0.0")
+    await backend.spawn_member(member_name="dev-1", display_name="Dev 1", agent_card=card)
+    # Manually transition to STARTING so startup_member sees non-UNSTARTED.
+    await db.member.update_member_status("dev-1", team_id, MemberStatus.STARTING.value)
+
+    on_created = AsyncMock()
+    result = await backend.startup_member("dev-1", on_created=on_created)
+
+    assert result is False
+    on_created.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_startup_member_returns_false_for_unknown_member(db, message_bus):
+    """startup_member returns False for a member that does not exist."""
+    team_id = "unknown_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="Unknown Team",
+        leader_member_name="leader1",
+    )
+    backend = TeamBackend(
+        team_name=team_id,
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+    )
+
+    on_created = AsyncMock()
+    result = await backend.startup_member("ghost", on_created=on_created)
+
+    assert result is False
+    on_created.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_startup_member_rollback_on_spawn_failure(db, message_bus):
+    """startup_member rolls back STARTING→UNSTARTED when on_created raises."""
+    team_id = "rollback_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="Rollback Team",
+        leader_member_name="leader1",
+    )
+    backend = TeamBackend(
+        team_name=team_id,
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+    )
+    card = AgentCard(name="Dev1", description="dev 1", version="1.0.0")
+    await backend.spawn_member(member_name="dev-1", display_name="Dev 1", agent_card=card)
+
+    on_created = AsyncMock(side_effect=RuntimeError("spawn crashed"))
+    with pytest.raises(RuntimeError, match="spawn crashed"):
+        await backend.startup_member("dev-1", on_created=on_created)
+
+    # Status should be rolled back to UNSTARTED for retry.
+    member = await db.member.get_member("dev-1", team_id)
+    assert member.status == MemberStatus.UNSTARTED.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_startup_delegates_to_startup_member(db, message_bus):
+    """startup() uses startup_member per member, so all go through STARTING CAS."""
+    team_id = "batch_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="Batch Team",
+        leader_member_name="leader1",
+    )
+    backend = TeamBackend(
+        team_name=team_id,
+        member_name="leader1",
+        db=db,
+        messager=message_bus,
+        is_leader=True,
+    )
+    card1 = AgentCard(name="Dev1", description="dev 1", version="1.0.0")
+    card2 = AgentCard(name="Dev2", description="dev 2", version="1.0.0")
+    await backend.spawn_member(member_name="dev-1", display_name="Dev 1", agent_card=card1)
+    await backend.spawn_member(member_name="dev-2", display_name="Dev 2", agent_card=card2)
+
+    on_created = AsyncMock()
+    started = await backend.startup(on_created=on_created)
+
+    assert sorted(started) == ["dev-1", "dev-2"]
+    call_args = [call[0][0] for call in on_created.await_args_list]
+    assert sorted(call_args) == ["dev-1", "dev-2"]
+    # Both members should be in STARTING state.
+    m1 = await db.member.get_member("dev-1", team_id)
+    m2 = await db.member.get_member("dev-2", team_id)
+    assert m1.status == MemberStatus.STARTING.value
+    assert m2.status == MemberStatus.STARTING.value
+
+
+@pytest.mark.asyncio
+@pytest.mark.level0
+async def test_try_transition_member_status_atomic_cas(db):
+    """try_transition_member_status uses atomic UPDATE WHERE, only one caller succeeds."""
+    team_id = "cas_team"
+    await db.team.create_team(
+        team_name=team_id,
+        display_name="CAS Team",
+        leader_member_name="leader1",
+    )
+    await db.member.create_member(
+        member_name="dev-1",
+        team_name=team_id,
+        display_name="Dev 1",
+        agent_card="{}",
+        status=MemberStatus.UNSTARTED.value,
+        role=TeamRole.TEAMMATE.value,
+    )
+
+    # First caller succeeds: UNSTARTED → STARTING.
+    ok1 = await db.member.try_transition_member_status(
+        "dev-1", team_id, MemberStatus.UNSTARTED, MemberStatus.STARTING,
+    )
+    assert ok1 is True
+
+    # Second caller fails: member is now STARTING, not UNSTARTED.
+    ok2 = await db.member.try_transition_member_status(
+        "dev-1", team_id, MemberStatus.UNSTARTED, MemberStatus.STARTING,
+    )
+    assert ok2 is False

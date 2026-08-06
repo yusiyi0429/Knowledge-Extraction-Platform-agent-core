@@ -1,0 +1,54 @@
+# coding: utf-8
+# Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
+
+"""Schemas for agent teams."""
+
+from openjiuwen.agent_teams.schema.blueprint import (
+    DeepAgentSpec,
+    LeaderSpec,
+    StorageSpec,
+    TeamAgentSpec,
+    TransportSpec,
+    register_storage,
+    register_transport,
+)
+from openjiuwen.agent_teams.schema.deep_agent_spec import (
+    AudioModelSpec,
+    ProgressiveToolSpec,
+    RailSpec,
+    SubAgentSpec,
+    SysOperationSpec,
+    VisionModelSpec,
+    WorkspaceSpec,
+)
+from openjiuwen.agent_teams.schema.stream import TeamOutputSchema
+from openjiuwen.agent_teams.schema.team import (
+    TeamLifecycle,
+    TeamMemberSpec,
+    TeamRole,
+    TeamRuntimeContext,
+    TeamSpec,
+)
+
+__all__ = [
+    "AudioModelSpec",
+    "DeepAgentSpec",
+    "LeaderSpec",
+    "ProgressiveToolSpec",
+    "RailSpec",
+    "StorageSpec",
+    "SubAgentSpec",
+    "SysOperationSpec",
+    "TeamAgentSpec",
+    "TeamOutputSchema",
+    "TransportSpec",
+    "VisionModelSpec",
+    "WorkspaceSpec",
+    "register_storage",
+    "register_transport",
+    "TeamLifecycle",
+    "TeamMemberSpec",
+    "TeamRole",
+    "TeamRuntimeContext",
+    "TeamSpec",
+]
