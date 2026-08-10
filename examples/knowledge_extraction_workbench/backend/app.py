@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import csv
 import hashlib
 import io
 import json
@@ -15,6 +16,7 @@ from urllib.parse import urlparse
 
 import aiofiles
 from aiohttp import web
+from openpyxl import Workbook, load_workbook
 from sqlmodel import func, select
 
 from .config import SecretBox, Settings
@@ -23,9 +25,11 @@ from .models import (
     AbilityProfile,
     AbilityMount,
     Asset,
+    EvaluationRun,
     Exploration,
     ExplorationCandidate,
     ExtractionRound,
+    FeedbackTask,
     Job,
     KnowledgeDocument,
     Material,
@@ -162,6 +166,25 @@ def _asset_dict(asset: Asset, current_revision: int | None = None) -> dict[str, 
         "size_bytes": path.stat().st_size if path.is_file() else 0,
         "created_at": _iso(asset.created_at),
         "download_url": f"/api/v1/assets/{asset.id}/download",
+        "preview_url": f"/api/v1/assets/{asset.id}/preview",
+    }
+
+
+def _preview_cell(value: Any) -> str | int | float | bool | None:
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, datetime):
+        return value.isoformat(timespec="seconds")
+    return str(value)
+
+
+def _asset_base_preview(asset: Asset, mode: str) -> dict[str, Any]:
+    return {
+        "id": asset.id,
+        "kind": asset.kind,
+        "filename": asset.filename,
+        "mode": mode,
+        "download_url": f"/api/v1/assets/{asset.id}/download",
     }
 
 
@@ -198,6 +221,45 @@ def _skill_dict(skill: SkillVersion) -> dict[str, Any]:
         "manifest": manifest,
         "created_at": _iso(skill.created_at),
         "download_url": f"/api/v1/skills/{skill.id}/download",
+    }
+
+
+def _evaluation_dict(evaluation: EvaluationRun) -> dict[str, Any]:
+    return {
+        "id": evaluation.id,
+        "round_id": evaluation.round_id,
+        "model_connection_id": evaluation.model_connection_id,
+        "job_id": evaluation.job_id,
+        "dataset_name": evaluation.dataset_name,
+        "dataset_kind": evaluation.dataset_kind,
+        "status": evaluation.status,
+        "sample_count": evaluation.sample_count,
+        "correct_count": evaluation.correct_count,
+        "wrong_count": max(0, evaluation.sample_count - evaluation.correct_count),
+        "review_count": evaluation.review_count,
+        "accuracy": evaluation.accuracy,
+        "results": _json_loads(evaluation.results_json, []),
+        "created_at": _iso(evaluation.created_at),
+        "completed_at": _iso(evaluation.completed_at),
+    }
+
+
+def _feedback_task_dict(task: FeedbackTask) -> dict[str, Any]:
+    cases = _json_loads(task.cases_json, [])
+    return {
+        "id": task.id,
+        "round_id": task.round_id,
+        "model_connection_id": task.model_connection_id,
+        "job_id": task.job_id,
+        "name": task.name,
+        "task_type": task.task_type,
+        "status": task.status,
+        "source_filename": task.source_filename,
+        "case_count": len(cases) if isinstance(cases, list) else 0,
+        "cases": cases if isinstance(cases, list) else [],
+        "promoted_round_id": task.promoted_round_id,
+        "created_at": _iso(task.created_at),
+        "updated_at": _iso(task.updated_at),
     }
 
 
@@ -870,9 +932,588 @@ async def download_asset(request: web.Request) -> web.StreamResponse:
     return response
 
 
+async def preview_asset(request: web.Request) -> web.Response:
+    asset = request.app[APP_STORE].get(Asset, request.match_info["asset_id"], code="ASSET_NOT_FOUND")
+    path = Path(asset.file_path)
+    if not path.is_file():
+        raise WorkbenchError("ASSET_FILE_MISSING", "资产文件不存在，请重新生成。", status=404)
+
+    if asset.kind == "RULES_XLSX":
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = workbook.active
+            values: list[list[str | int | float | bool | None]] = []
+            truncated = False
+            for index, row in enumerate(sheet.iter_rows(values_only=True)):
+                if index > 50:
+                    truncated = True
+                    break
+                values.append([_preview_cell(value) for value in row])
+        finally:
+            workbook.close()
+        payload = _asset_base_preview(asset, "table") | {
+            "sheet": sheet.title,
+            "columns": [str(value or "") for value in values[0]] if values else [],
+            "rows": values[1:] if values else [],
+            "truncated": truncated,
+        }
+    elif asset.kind == "THOUGHT_CHAIN_MD":
+        with path.open("r", encoding="utf-8", errors="replace") as file:
+            text = file.read(20_001)
+        payload = _asset_base_preview(asset, "markdown") | {
+            "text": text[:20_000],
+            "truncated": len(text) > 20_000,
+        }
+    elif asset.kind == "SKILL_ZIP":
+        with zipfile.ZipFile(path) as archive:
+            infos = [info for info in archive.infolist() if not info.is_dir()]
+            entries = [
+                {"path": info.filename, "size_bytes": info.file_size}
+                for info in infos[:100]
+            ]
+            skill_text = ""
+            try:
+                skill_info = archive.getinfo("SKILL.md")
+                if skill_info.file_size <= 64 * 1024:
+                    skill_text = archive.read(skill_info).decode("utf-8", errors="replace")
+            except KeyError:
+                pass
+        payload = _asset_base_preview(asset, "archive") | {
+            "entries": entries,
+            "text": skill_text,
+            "truncated": len(infos) > 100,
+        }
+    elif asset.kind in {"QA_JSONL", "EVAL_JSONL"}:
+        items: list[Any] = []
+        truncated = False
+        with path.open("r", encoding="utf-8", errors="replace") as file:
+            for line in file:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                if len(items) >= 50:
+                    truncated = True
+                    break
+                try:
+                    items.append(json.loads(stripped))
+                except json.JSONDecodeError:
+                    items.append({"raw": stripped})
+        payload = _asset_base_preview(asset, "jsonl") | {
+            "items": items,
+            "truncated": truncated,
+        }
+    else:
+        raise WorkbenchError("ASSET_PREVIEW_UNSUPPORTED", "该资产类型暂不支持预览。", status=422)
+
+    response = web.json_response(payload)
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
+async def download_round_assets(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    round_id = request.match_info["round_id"]
+    round_row = store.get(ExtractionRound, round_id, code="ROUND_NOT_FOUND")
+    with store.session() as session:
+        rows = session.exec(
+            select(Asset).where(Asset.round_id == round_id).order_by(Asset.kind, Asset.version.desc())
+        ).all()
+        document = session.exec(select(KnowledgeDocument).where(KnowledgeDocument.round_id == round_id)).first()
+    if document is None:
+        raise WorkbenchError("DOCUMENT_REQUIRED", "知识文档不存在。", status=409)
+
+    latest: dict[str, Asset] = {}
+    for row in rows:
+        latest.setdefault(row.kind, row)
+    unavailable = sorted(
+        kind
+        for kind in REQUIRED_ASSET_KINDS
+        if kind not in latest or latest[kind].source_revision != document.revision
+    )
+    if unavailable:
+        raise WorkbenchError(
+            "ASSETS_INCOMPLETE",
+            "五类当前版本资产尚未全部生成，无法打包下载。",
+            status=409,
+            details={"unavailable": unavailable, "document_revision": document.revision},
+        )
+
+    assets = [latest[kind] for kind in sorted(REQUIRED_ASSET_KINDS)]
+    missing_files = [asset.kind for asset in assets if not Path(asset.file_path).is_file()]
+    if missing_files:
+        raise WorkbenchError(
+            "ASSET_FILE_MISSING",
+            "部分资产文件不存在，请重新生成后下载。",
+            status=404,
+            details={"missing": missing_files},
+        )
+
+    manifest = {
+        "round_id": round_id,
+        "round_version": round_row.version,
+        "document_revision": document.revision,
+        "assets": [
+            {
+                "kind": asset.kind,
+                "filename": asset.filename,
+                "version": asset.version,
+                "source_revision": asset.source_revision,
+                "synthetic": asset.synthetic,
+            }
+            for asset in assets
+        ],
+    }
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
+        for asset in assets:
+            archive.write(asset.file_path, arcname=asset.filename)
+
+    response = web.Response(body=buffer.getvalue(), content_type="application/zip")
+    response.headers["Content-Disposition"] = f'attachment; filename="knowledge-assets-v{round_row.version}.zip"'
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 async def publish_round(request: web.Request) -> web.Response:
     round_row = request.app[APP_SERVICE].publish_round(request.match_info["round_id"])
     return web.json_response(_round_dict(round_row))
+
+
+def _published_skill_dict(
+    round_row: ExtractionRound,
+    scene: Scene,
+    skill_asset: Asset | None,
+    evaluation_asset: Asset | None,
+) -> dict[str, Any]:
+    return {
+        "id": round_row.id,
+        "round_id": round_row.id,
+        "scene_id": scene.id,
+        "name": scene.name,
+        "version": round_row.version,
+        "label": f"{scene.name} v{round_row.version}",
+        "published_at": _iso(round_row.published_at),
+        "has_skill_asset": skill_asset is not None,
+        "evaluation_asset": _asset_dict(evaluation_asset) if evaluation_asset else None,
+    }
+
+
+async def list_runtime_skills(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    with store.session() as session:
+        rounds = session.exec(
+            select(ExtractionRound)
+            .where(ExtractionRound.status == "PUBLISHED")
+            .order_by(ExtractionRound.published_at.desc())
+        ).all()
+        items = []
+        for round_row in rounds:
+            scene = session.get(Scene, round_row.scene_id)
+            if scene is None or scene.archived_at is not None:
+                continue
+            skill_asset = session.exec(
+                select(Asset)
+                .where(Asset.round_id == round_row.id, Asset.kind == "SKILL_ZIP")
+                .order_by(Asset.version.desc())
+            ).first()
+            evaluation_asset = session.exec(
+                select(Asset)
+                .where(Asset.round_id == round_row.id, Asset.kind == "EVAL_JSONL")
+                .order_by(Asset.version.desc())
+            ).first()
+            items.append(_published_skill_dict(round_row, scene, skill_asset, evaluation_asset))
+    return web.json_response({"items": items})
+
+
+async def _receive_form_file(
+    request: web.Request,
+    *,
+    parent: Path,
+    allowed_extensions: set[str],
+) -> tuple[dict[str, str], Path, str, str]:
+    settings = request.app[APP_SETTINGS]
+    try:
+        reader = await request.multipart()
+    except (AssertionError, web.HTTPBadRequest) as exc:
+        raise WorkbenchError("UPLOAD_MULTIPART_REQUIRED", "请使用 multipart/form-data 上传文件。", status=400) from exc
+    fields: dict[str, str] = {}
+    target: Path | None = None
+    safe_name = ""
+    digest_hex = ""
+    part = await reader.next()
+    try:
+        while part is not None:
+            if part.filename and target is None:
+                original_name = part.filename
+                safe_name = PurePath(original_name).name
+                if not safe_name or safe_name != original_name.replace("\\", "/").split("/")[-1]:
+                    raise WorkbenchError("UPLOAD_FILENAME_INVALID", "文件名不安全。", status=422)
+                suffix = Path(safe_name).suffix.lower()
+                if suffix not in allowed_extensions:
+                    raise WorkbenchError(
+                        "DATASET_FORMAT_UNSUPPORTED",
+                        "文件格式不受支持，请按页面提示上传。",
+                        status=415,
+                        details={"extension": suffix},
+                    )
+                parent.mkdir(parents=True, exist_ok=False)
+                target = parent / safe_name
+                partial = parent / f"{safe_name}.uploading"
+                digest = hashlib.sha256()
+                size = 0
+                async with aiofiles.open(partial, "wb") as stream:
+                    while chunk := await part.read_chunk(size=1024 * 1024):
+                        size += len(chunk)
+                        if size > settings.max_upload_bytes:
+                            raise WorkbenchError("DATASET_TOO_LARGE", "上传文件超过单文件大小限制。", status=413)
+                        digest.update(chunk)
+                        await stream.write(chunk)
+                partial.replace(target)
+                digest_hex = digest.hexdigest()
+            elif part.name:
+                fields[part.name] = (await part.text()).strip()
+            part = await reader.next()
+    except Exception:
+        shutil.rmtree(parent, ignore_errors=True)
+        raise
+    if target is None:
+        raise WorkbenchError("UPLOAD_FILE_REQUIRED", "请选择要上传的文件。", status=422)
+    return fields, target, safe_name, digest_hex
+
+
+def _rows_from_file(path: Path) -> list[dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix == ".jsonl":
+        rows = []
+        for line in path.read_text(encoding="utf-8-sig").splitlines():
+            if not line.strip():
+                continue
+            value = json.loads(line)
+            if isinstance(value, dict):
+                rows.append(value)
+        return rows
+    if suffix == ".json":
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+        if isinstance(value, dict):
+            value = value.get("items", value.get("cases", []))
+        return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+    if suffix in {".csv", ".tsv"}:
+        with path.open("r", encoding="utf-8-sig", newline="") as stream:
+            return list(csv.DictReader(stream, delimiter="\t" if suffix == ".tsv" else ","))
+    if suffix == ".xlsx":
+        workbook = load_workbook(path, read_only=True, data_only=True)
+        try:
+            sheet = workbook.active
+            values = sheet.iter_rows(values_only=True)
+            headers = [str(value or "").strip() for value in next(values, [])]
+            return [
+                {headers[index]: value for index, value in enumerate(row) if index < len(headers) and headers[index]}
+                for row in values
+                if any(value not in (None, "") for value in row)
+            ]
+        finally:
+            workbook.close()
+    if suffix in {".txt", ".md"}:
+        return [
+            {"input": line.strip(), "original_output": ""}
+            for line in path.read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
+    return []
+
+
+def _first_value(row: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
+
+
+def _evaluation_cases(path: Path) -> list[dict[str, Any]]:
+    try:
+        rows = _rows_from_file(path)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise WorkbenchError("EVALUATION_DATASET_INVALID", "测试集无法解析。", status=422) from exc
+    cases = []
+    for index, row in enumerate(rows[:101], start=1):
+        input_text = _first_value(row, ("input", "输入", "question", "问题"))
+        expected = _first_value(row, ("expected", "标准答案", "answer", "答案", "label", "标签"))
+        if input_text and expected:
+            cases.append(
+                {
+                    "id": _first_value(row, ("id", "编号")) or f"C-{index:03d}",
+                    "input": input_text[:20000],
+                    "expected": expected[:4000],
+                    "source_refs": row.get("source_refs", []) if isinstance(row.get("source_refs"), list) else [],
+                }
+            )
+    if not cases:
+        raise WorkbenchError(
+            "EVALUATION_DATASET_EMPTY",
+            "测试集至少需要 input/expected（或输入/标准答案）两列。",
+            status=422,
+        )
+    return cases
+
+
+def _feedback_cases(path: Path) -> list[dict[str, Any]]:
+    try:
+        rows = _rows_from_file(path)
+    except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as exc:
+        raise WorkbenchError("FEEDBACK_DATASET_INVALID", "错例文件无法解析。", status=422) from exc
+    cases = []
+    for index, row in enumerate(rows[:101], start=1):
+        input_text = _first_value(row, ("input", "输入", "question", "问题", "case", "案例"))
+        original_output = _first_value(row, ("original_output", "原输出", "output", "错误结果", "模型输出"))
+        expected = _first_value(row, ("expected", "标准答案", "correct", "正确结果", "正确标签"))
+        if input_text:
+            cases.append(
+                {
+                    "id": _first_value(row, ("id", "编号")) or f"E-{index:03d}",
+                    "summary": _first_value(row, ("summary", "摘要", "name", "名称")) or input_text[:80],
+                    "input": input_text[:20000],
+                    "original_output": original_output[:10000],
+                    "expected": expected[:4000],
+                }
+            )
+    if not cases:
+        raise WorkbenchError("FEEDBACK_CASES_EMPTY", "错例文件中没有可用输入。", status=422)
+    return cases
+
+
+async def runtime_tryout(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    result = await request.app[APP_SERVICE].run_tryout(
+        str(payload.get("round_id", "")),
+        str(payload.get("model_connection_id", "")),
+        str(payload.get("input", "")),
+    )
+    return web.json_response(result)
+
+
+async def runtime_tryout_upload(request: web.Request) -> web.Response:
+    parent = request.app[APP_SETTINGS].upload_dir / "runtime" / new_id()
+    try:
+        fields, path, _, _ = await _receive_form_file(
+            request,
+            parent=parent,
+            allowed_extensions=set(SUPPORTED_EXTENSIONS),
+        )
+        parsed = await parse_material(path, new_id())
+        instruction = fields.get("input", "")
+        input_text = f"用户说明：{instruction}\n\n上传资料：\n{parsed}" if instruction else parsed
+        result = await request.app[APP_SERVICE].run_tryout(
+            fields.get("round_id", ""),
+            fields.get("model_connection_id", ""),
+            input_text,
+        )
+        return web.json_response(result)
+    finally:
+        shutil.rmtree(parent, ignore_errors=True)
+
+
+async def list_evaluations(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    statement = select(EvaluationRun).order_by(EvaluationRun.created_at.desc())
+    round_id = request.query.get("round_id", "").strip()
+    if round_id:
+        statement = statement.where(EvaluationRun.round_id == round_id)
+    with store.session() as session:
+        rows = session.exec(statement).all()
+    return web.json_response({"items": [_evaluation_dict(item) for item in rows]})
+
+
+async def get_evaluation(request: web.Request) -> web.Response:
+    row = request.app[APP_STORE].get(EvaluationRun, request.match_info["evaluation_id"], code="EVALUATION_NOT_FOUND")
+    return web.json_response(_evaluation_dict(row))
+
+
+async def create_evaluation(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    round_id = str(payload.get("round_id", ""))
+    store = request.app[APP_STORE]
+    with store.session() as session:
+        asset = session.exec(
+            select(Asset)
+            .where(Asset.round_id == round_id, Asset.kind == "EVAL_JSONL")
+            .order_by(Asset.version.desc())
+        ).first()
+        if asset:
+            session.expunge(asset)
+    if asset is None or not Path(asset.file_path).is_file():
+        raise WorkbenchError("EVALUATION_ASSET_REQUIRED", "该 Skill 尚无可用评测集资产。", status=409)
+    cases = _evaluation_cases(Path(asset.file_path))
+    evaluation, job = request.app[APP_SERVICE].start_evaluation(
+        round_id=round_id,
+        model_id=str(payload.get("model_connection_id", "")),
+        dataset_name=asset.filename,
+        dataset_kind="GENERATED",
+        dataset_path=asset.file_path,
+        dataset_sha256=hashlib.sha256(Path(asset.file_path).read_bytes()).hexdigest(),
+        cases=cases,
+    )
+    return web.json_response({"evaluation": _evaluation_dict(evaluation), "job": _job_dict(job)}, status=202)
+
+
+async def upload_evaluation(request: web.Request) -> web.Response:
+    parent = request.app[APP_SETTINGS].upload_dir / "evaluations" / new_id()
+    fields, path, filename, digest = await _receive_form_file(
+        request,
+        parent=parent,
+        allowed_extensions={".jsonl", ".csv", ".tsv", ".xlsx"},
+    )
+    cases = _evaluation_cases(path)
+    evaluation, job = request.app[APP_SERVICE].start_evaluation(
+        round_id=fields.get("round_id", ""),
+        model_id=fields.get("model_connection_id", ""),
+        dataset_name=filename,
+        dataset_kind="UPLOADED",
+        dataset_path=str(path),
+        dataset_sha256=digest,
+        cases=cases,
+    )
+    return web.json_response({"evaluation": _evaluation_dict(evaluation), "job": _job_dict(job)}, status=202)
+
+
+async def evaluation_to_feedback(request: web.Request) -> web.Response:
+    evaluation = request.app[APP_STORE].get(
+        EvaluationRun, request.match_info["evaluation_id"], code="EVALUATION_NOT_FOUND"
+    )
+    if evaluation.status != "COMPLETED":
+        raise WorkbenchError("EVALUATION_NOT_COMPLETE", "评测完成后才能回流错例。", status=409)
+    payload = await _json_body(request)
+    results = _json_loads(evaluation.results_json, [])
+    cases = [
+        {
+            "id": item.get("id"),
+            "summary": str(item.get("input", ""))[:80],
+            "input": item.get("input", ""),
+            "original_output": item.get("answer", ""),
+            "expected": item.get("expected", ""),
+        }
+        for item in results
+        if isinstance(item, dict) and item.get("correct") is False
+    ]
+    if not cases:
+        raise WorkbenchError("EVALUATION_ERRORS_EMPTY", "本次评测没有可回流错例。", status=409)
+    task = request.app[APP_SERVICE].create_feedback_task(
+        round_id=evaluation.round_id,
+        model_id=evaluation.model_connection_id,
+        name=str(payload.get("name") or f"{evaluation.dataset_name} · 错例分析"),
+        task_type=str(payload.get("task_type", "CLASSIFICATION")),
+        cases=cases,
+        source_filename=evaluation.dataset_name,
+    )
+    return web.json_response(_feedback_task_dict(task), status=201)
+
+
+async def list_feedback_tasks(request: web.Request) -> web.Response:
+    store = request.app[APP_STORE]
+    with store.session() as session:
+        rows = session.exec(select(FeedbackTask).order_by(FeedbackTask.created_at.desc())).all()
+    return web.json_response({"items": [_feedback_task_dict(item) for item in rows]})
+
+
+async def get_feedback_task(request: web.Request) -> web.Response:
+    task = request.app[APP_STORE].get(
+        FeedbackTask, request.match_info["task_id"], code="FEEDBACK_TASK_NOT_FOUND"
+    )
+    return web.json_response(_feedback_task_dict(task))
+
+
+async def create_feedback_task(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    task = request.app[APP_SERVICE].create_feedback_task(
+        round_id=str(payload.get("round_id", "")),
+        model_id=str(payload.get("model_connection_id", "")),
+        name=str(payload.get("name", "")),
+        task_type=str(payload.get("task_type", "CLASSIFICATION")),
+    )
+    return web.json_response(_feedback_task_dict(task), status=201)
+
+
+async def upload_feedback_cases(request: web.Request) -> web.Response:
+    task_id = request.match_info["task_id"]
+    parent = request.app[APP_SETTINGS].upload_dir / "feedback" / task_id / new_id()
+    _, path, filename, digest = await _receive_form_file(
+        request,
+        parent=parent,
+        allowed_extensions={".json", ".jsonl", ".csv", ".tsv", ".xlsx", ".txt", ".md"},
+    )
+    task = request.app[APP_SERVICE].replace_feedback_cases(
+        task_id,
+        _feedback_cases(path),
+        source_filename=filename,
+        source_path=str(path),
+        source_sha256=digest,
+    )
+    return web.json_response(_feedback_task_dict(task))
+
+
+async def analyze_feedback_task(request: web.Request) -> web.Response:
+    task, job = request.app[APP_SERVICE].start_feedback_analysis(request.match_info["task_id"])
+    return web.json_response({"task": _feedback_task_dict(task), "job": _job_dict(job)}, status=202)
+
+
+async def save_feedback_task(request: web.Request) -> web.Response:
+    payload = await _json_body(request)
+    cases = payload.get("cases", [])
+    if not isinstance(cases, list):
+        raise WorkbenchError("FEEDBACK_CASES_INVALID", "cases 必须是数组。", status=422)
+    task = request.app[APP_SERVICE].save_feedback_cases(request.match_info["task_id"], cases)
+    return web.json_response(_feedback_task_dict(task))
+
+
+async def export_feedback_task(request: web.Request) -> web.Response:
+    task = request.app[APP_STORE].get(
+        FeedbackTask, request.match_info["task_id"], code="FEEDBACK_TASK_NOT_FOUND"
+    )
+    cases = _json_loads(task.cases_json, [])
+    output_format = request.query.get("format", "json").lower()
+    if output_format == "json":
+        body = json.dumps({"task": task.name, "task_type": task.task_type, "items": cases}, ensure_ascii=False, indent=2)
+        response = web.Response(text=body, content_type="application/json")
+        response.headers["Content-Disposition"] = f'attachment; filename="feedback-{task.id[:8]}.json"'
+        return response
+    if output_format != "xlsx":
+        raise WorkbenchError("FEEDBACK_EXPORT_FORMAT_INVALID", "仅支持 JSON 或 XLSX。", status=422)
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "错例分析"
+    sheet.append(["编号", "输入", "原输出", "标准答案", "专家结论", "错因/问题", "知识缺口", "归因"])
+    for case in cases:
+        expert = case.get("expert", {}) if isinstance(case.get("expert"), dict) else {}
+        sheet.append(
+            [
+                case.get("id", ""),
+                case.get("input", ""),
+                case.get("original_output", ""),
+                case.get("expected", ""),
+                expert.get("correct_label") or expert.get("expected_content") or "",
+                expert.get("error_reason")
+                or "\n".join(
+                    str(item.get("description", ""))
+                    for item in expert.get("issues", [])
+                    if isinstance(item, dict)
+                ),
+                expert.get("knowledge_gap", ""),
+                expert.get("attribution", ""),
+            ]
+        )
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    response = web.Response(body=buffer.getvalue(), content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    response.headers["Content-Disposition"] = f'attachment; filename="feedback-{task.id[:8]}.xlsx"'
+    return response
+
+
+async def promote_feedback_task(request: web.Request) -> web.Response:
+    task, round_row, scene = request.app[APP_SERVICE].promote_feedback_task(request.match_info["task_id"])
+    return web.json_response(
+        {"task": _feedback_task_dict(task), "round": _round_dict(round_row), "scene_id": scene.id}
+    )
 
 
 def _validate_model_endpoint(provider: str, api_base: str) -> None:
@@ -909,7 +1550,7 @@ async def create_model(request: web.Request) -> web.Response:
     model_name = str(payload.get("model_name", "")).strip()
     api_key = str(payload.get("api_key", "")).strip()
     if not name or not provider or not model_name:
-        raise WorkbenchError("MODEL_FIELDS_REQUIRED", "名称、Provider 和模型名称为必填项。", status=422)
+        raise WorkbenchError("MODEL_FIELDS_REQUIRED", "名称、调用适配器和模型名称为必填项。", status=422)
     if not api_key:
         raise WorkbenchError("MODEL_API_KEY_REQUIRED", "请输入 API Key。", status=422)
     _validate_model_endpoint(provider, api_base)
@@ -1569,8 +2210,26 @@ def create_app(settings: Settings | None = None, *, test_model: Any | None = Non
     app.router.add_post("/api/v1/suggestions/{suggestion_id}/reject", reject_suggestion)
     app.router.add_get("/api/v1/rounds/{round_id}/assets", list_assets)
     app.router.add_post("/api/v1/rounds/{round_id}/assets", generate_round_assets)
+    app.router.add_get("/api/v1/rounds/{round_id}/assets/download", download_round_assets)
     app.router.add_get("/api/v1/assets/{asset_id}/download", download_asset)
+    app.router.add_get("/api/v1/assets/{asset_id}/preview", preview_asset)
     app.router.add_post("/api/v1/rounds/{round_id}/publish", publish_round)
+    app.router.add_get("/api/v1/runtime/skills", list_runtime_skills)
+    app.router.add_post("/api/v1/runtime/tryouts", runtime_tryout)
+    app.router.add_post("/api/v1/runtime/tryouts/upload", runtime_tryout_upload)
+    app.router.add_get("/api/v1/evaluations", list_evaluations)
+    app.router.add_post("/api/v1/evaluations", create_evaluation)
+    app.router.add_post("/api/v1/evaluations/upload", upload_evaluation)
+    app.router.add_get("/api/v1/evaluations/{evaluation_id}", get_evaluation)
+    app.router.add_post("/api/v1/evaluations/{evaluation_id}/feedback", evaluation_to_feedback)
+    app.router.add_get("/api/v1/feedback-tasks", list_feedback_tasks)
+    app.router.add_post("/api/v1/feedback-tasks", create_feedback_task)
+    app.router.add_get("/api/v1/feedback-tasks/{task_id}", get_feedback_task)
+    app.router.add_put("/api/v1/feedback-tasks/{task_id}", save_feedback_task)
+    app.router.add_post("/api/v1/feedback-tasks/{task_id}/cases", upload_feedback_cases)
+    app.router.add_post("/api/v1/feedback-tasks/{task_id}/analyze", analyze_feedback_task)
+    app.router.add_get("/api/v1/feedback-tasks/{task_id}/export", export_feedback_task)
+    app.router.add_post("/api/v1/feedback-tasks/{task_id}/promote", promote_feedback_task)
     app.router.add_get("/api/v1/models", list_models)
     app.router.add_post("/api/v1/models", create_model)
     app.router.add_put("/api/v1/models/{model_id}", update_model)

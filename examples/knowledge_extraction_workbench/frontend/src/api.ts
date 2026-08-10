@@ -35,6 +35,17 @@ export async function upload<T>(path: string, file: File): Promise<T> {
   return api<T>(path, { method: "POST", body: form });
 }
 
+export async function uploadWithFields<T>(
+  path: string,
+  file: File,
+  fields: Record<string, string>,
+): Promise<T> {
+  const form = new FormData();
+  for (const [key, value] of Object.entries(fields)) form.append(key, value);
+  form.append("file", file, file.name);
+  return api<T>(path, { method: "POST", body: form });
+}
+
 export function watchJob(
   jobId: string,
   onEvent: (event: JobEvent) => void,

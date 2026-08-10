@@ -169,6 +169,31 @@ async def test_complete_injected_model_workflow_and_immutable_publish(tmp_path):
         assert download_response.status == 200
         assert await download_response.read()
 
+        previews = {}
+        for asset in asset_payload["items"]:
+            preview_response = await client.get(asset["preview_url"])
+            assert preview_response.status == 200, await preview_response.text()
+            previews[asset["kind"]] = await preview_response.json()
+        assert previews["RULES_XLSX"]["mode"] == "table"
+        assert previews["RULES_XLSX"]["columns"][0] == "规则ID"
+        assert previews["RULES_XLSX"]["rows"]
+        assert previews["THOUGHT_CHAIN_MD"]["mode"] == "markdown"
+        assert "决策研判链" in previews["THOUGHT_CHAIN_MD"]["text"]
+        assert previews["SKILL_ZIP"]["mode"] == "archive"
+        assert "SKILL.md" in {entry["path"] for entry in previews["SKILL_ZIP"]["entries"]}
+        assert previews["QA_JSONL"]["items"]
+        assert previews["EVAL_JSONL"]["items"]
+
+        bundle_response = await client.get(f"/api/v1/rounds/{round_id}/assets/download")
+        assert bundle_response.status == 200, await bundle_response.text()
+        assert bundle_response.content_type == "application/zip"
+        with zipfile.ZipFile(io.BytesIO(await bundle_response.read())) as bundle:
+            bundled_names = set(bundle.namelist())
+            assert "manifest.json" in bundled_names
+            assert {item["filename"] for item in asset_payload["items"]}.issubset(bundled_names)
+            manifest = json.loads(bundle.read("manifest.json"))
+            assert manifest["document_revision"] == saved_document["revision"]
+
         publish_response = await client.post(f"/api/v1/rounds/{round_id}/publish")
         assert publish_response.status == 200
         assert (await publish_response.json())["status"] == "PUBLISHED"
@@ -179,11 +204,124 @@ async def test_complete_injected_model_workflow_and_immutable_publish(tmp_path):
         assert immutable_response.status == 409
         assert (await immutable_response.json())["code"] == "ROUND_IMMUTABLE"
 
-        next_round_response = await client.post(f"/api/v1/scenes/{scene_id}/rounds")
-        next_round = await next_round_response.json()
+        runtime_model_response = await client.post(
+            "/api/v1/models",
+            json={
+                "name": "评测模型",
+                "provider": "DeepSeek",
+                "api_base": "https://example.invalid/v1",
+                "model_name": "evaluation-test-model",
+                "api_key": "test-secret",
+            },
+        )
+        assert runtime_model_response.status == 201
+        runtime_model = await runtime_model_response.json()
+
+        runtime_skills = await (await client.get("/api/v1/runtime/skills")).json()
+        assert runtime_skills["items"][0]["round_id"] == round_id
+        assert runtime_skills["items"][0]["evaluation_asset"]["kind"] == "EVAL_JSONL"
+
+        tryout_response = await client.post(
+            "/api/v1/runtime/tryouts",
+            json={
+                "round_id": round_id,
+                "model_connection_id": runtime_model["id"],
+                "input": "一笔资料不完整的差旅申请应如何处理？",
+            },
+        )
+        assert tryout_response.status == 200, await tryout_response.text()
+        assert (await tryout_response.json())["matched_rules"]
+
+        tryout_form = FormData()
+        tryout_form.add_field("round_id", round_id)
+        tryout_form.add_field("model_connection_id", runtime_model["id"])
+        tryout_form.add_field("input", "结合附件判断")
+        tryout_form.add_field(
+            "file",
+            "资料不完整时应退回补充，不得直接通过。".encode(),
+            filename="tryout-case.txt",
+            content_type="text/plain",
+        )
+        tryout_upload_response = await client.post("/api/v1/runtime/tryouts/upload", data=tryout_form)
+        assert tryout_upload_response.status == 200, await tryout_upload_response.text()
+
+        custom_evaluation_form = FormData()
+        custom_evaluation_form.add_field("round_id", round_id)
+        custom_evaluation_form.add_field("model_connection_id", runtime_model["id"])
+        custom_evaluation_form.add_field(
+            "file",
+            "input,expected\n资料不完整时如何处理,退回申请人补充\n".encode(),
+            filename="custom-evaluation.csv",
+            content_type="text/csv",
+        )
+        custom_evaluation_response = await client.post(
+            "/api/v1/evaluations/upload",
+            data=custom_evaluation_form,
+        )
+        assert custom_evaluation_response.status == 202, await custom_evaluation_response.text()
+        custom_evaluation = await custom_evaluation_response.json()
+        custom_result = await wait_for_job(client, custom_evaluation["job"]["id"])
+        assert custom_result["status"] == "COMPLETED", custom_result
+        custom_snapshot = await (
+            await client.get(f"/api/v1/evaluations/{custom_evaluation['evaluation']['id']}")
+        ).json()
+        assert custom_snapshot["dataset_kind"] == "UPLOADED"
+        assert custom_snapshot["sample_count"] == 1
+
+        evaluation_response = await client.post(
+            "/api/v1/evaluations",
+            json={"round_id": round_id, "model_connection_id": runtime_model["id"]},
+        )
+        assert evaluation_response.status == 202, await evaluation_response.text()
+        evaluation_payload = await evaluation_response.json()
+        evaluation_result = await wait_for_job(client, evaluation_payload["job"]["id"])
+        assert evaluation_result["status"] == "COMPLETED", evaluation_result
+        evaluation = await (
+            await client.get(f"/api/v1/evaluations/{evaluation_payload['evaluation']['id']}")
+        ).json()
+        assert evaluation["sample_count"] > 1
+        assert len(evaluation["results"]) == evaluation["sample_count"]
+        assert evaluation["accuracy"] is not None
+        assert evaluation["wrong_count"] > 0
+
+        feedback_response = await client.post(
+            f"/api/v1/evaluations/{evaluation['id']}/feedback",
+            json={"task_type": "CLASSIFICATION"},
+        )
+        assert feedback_response.status == 201, await feedback_response.text()
+        feedback = await feedback_response.json()
+        assert feedback["case_count"] == evaluation["wrong_count"]
+
+        analyze_response = await client.post(f"/api/v1/feedback-tasks/{feedback['id']}/analyze")
+        assert analyze_response.status == 202, await analyze_response.text()
+        analyze_payload = await analyze_response.json()
+        analyze_result = await wait_for_job(client, analyze_payload["job"]["id"])
+        assert analyze_result["status"] == "COMPLETED", analyze_result
+        reviewed = await (await client.get(f"/api/v1/feedback-tasks/{feedback['id']}")).json()
+        assert reviewed["status"] == "REVIEW"
+        assert reviewed["cases"][0]["analysis"]["knowledge_gap"]
+
+        reviewed_cases = [{**item, "expert_confirmed": True} for item in reviewed["cases"]]
+        save_feedback_response = await client.put(
+            f"/api/v1/feedback-tasks/{feedback['id']}",
+            json={"cases": reviewed_cases},
+        )
+        assert save_feedback_response.status == 200
+        assert (await save_feedback_response.json())["status"] == "READY"
+
+        json_export = await client.get(f"/api/v1/feedback-tasks/{feedback['id']}/export?format=json")
+        xlsx_export = await client.get(f"/api/v1/feedback-tasks/{feedback['id']}/export?format=xlsx")
+        assert json_export.status == 200 and await json_export.read()
+        assert xlsx_export.status == 200 and await xlsx_export.read()
+
+        promote_response = await client.post(f"/api/v1/feedback-tasks/{feedback['id']}/promote")
+        assert promote_response.status == 200, await promote_response.text()
+        promoted = await promote_response.json()
+        next_round = promoted["round"]
         assert next_round["version"] == 2
         copied_materials = await (await client.get(f"/api/v1/rounds/{next_round['id']}/materials")).json()
-        assert len(copied_materials["items"]) == 1
+        assert len(copied_materials["items"]) == 2
+        assert {item["role"] for item in copied_materials["items"]} == {"REFERENCE", "FEEDBACK"}
     finally:
         await client.close()
 
@@ -290,7 +428,8 @@ async def test_real_model_ability_scopes_and_skill_instance_versions(tmp_path):
 
         skills = await (await client.get("/api/v1/skills")).json()
         templates = skills["items"]
-        assert len(templates) == 6
+        assert len(templates) == 7
+        assert "错例分析与回流 Skill" in {item["name"] for item in templates}
         assert {item["kind"] for item in templates} == {"TEMPLATE"}
         assert all(item["read_only"] for item in templates)
 

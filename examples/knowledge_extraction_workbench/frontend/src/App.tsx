@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState, type FormEvent, type ReactNode } from "react";
 
 import { DashboardPage } from "./DashboardPage";
+import { FeedbackPage } from "./FeedbackPage";
 import { ModelsPage } from "./ModelsPage";
+import { RunEvaluationPage } from "./RunEvaluationPage";
 import { SceneWizard } from "./SceneWizard";
 import { SettingsPage } from "./SettingsPage";
 import { UsersPage } from "./UsersPage";
@@ -15,6 +17,8 @@ interface LocalSession {
 type Route =
   | { page: "dashboard" }
   | { page: "scene"; sceneId: string }
+  | { page: "evaluation" }
+  | { page: "feedback"; taskId?: string }
   | { page: "settings" }
   | { page: "models" }
   | { page: "users" };
@@ -25,6 +29,8 @@ function parseRoute(): Route {
   const value = window.location.hash.replace(/^#\/?/, "");
   const parts = value.split("/").filter(Boolean);
   if (parts[0] === "scenes" && parts[1]) return { page: "scene", sceneId: parts[1] };
+  if (parts[0] === "evaluation") return { page: "evaluation" };
+  if (parts[0] === "feedback") return { page: "feedback", taskId: parts[1] };
   if (parts[0] === "settings") return { page: "settings" };
   if (parts[0] === "models") return { page: "models" };
   if (parts[0] === "users") return { page: "users" };
@@ -68,6 +74,8 @@ export default function App() {
     <Shell route={route} session={session} onLogout={logout}>
       {route.page === "dashboard" && <DashboardPage onOpenScene={(sceneId) => { window.location.hash = `#/scenes/${sceneId}`; }} />}
       {route.page === "scene" && <SceneWizard sceneId={route.sceneId} onBack={() => { window.location.hash = "#/"; }} />}
+      {route.page === "evaluation" && <RunEvaluationPage />}
+      {route.page === "feedback" && <FeedbackPage initialTaskId={route.taskId} />}
       {route.page === "settings" && <SettingsPage />}
       {route.page === "models" && <ModelsPage />}
       {route.page === "users" && <UsersPage />}
@@ -116,11 +124,13 @@ function LocalLogin({ onLogin }: { onLogin: (displayName: string) => void }) {
 function Shell({ route, session, onLogout, children }: { route: Route; session: LocalSession; onLogout: () => void; children: ReactNode }) {
   const crumb = useMemo(() => {
     if (route.page === "scene") return ["工作台", "场景工作区"];
-    return { dashboard: ["工作台"], settings: ["智能体与 Skill"], models: ["模型接入"], users: ["用户管理"] }[route.page];
+    return { dashboard: ["工作台"], evaluation: ["智能体运行与评测"], feedback: ["错例分析与回流"], settings: ["智能体与 Skill"], models: ["模型接入"], users: ["用户管理"] }[route.page];
   }, [route]);
 
   const nav: Array<{ page: Route["page"]; label: string; icon: IconName; hash: string }> = [
     { page: "dashboard", label: "工作台", icon: "grid", hash: "#/" },
+    { page: "evaluation", label: "运行与评测", icon: "trend", hash: "#/evaluation" },
+    { page: "feedback", label: "错例分析与回流", icon: "refresh", hash: "#/feedback" },
     { page: "settings", label: "智能体与 Skill", icon: "settings", hash: "#/settings" },
     { page: "models", label: "模型接入", icon: "model", hash: "#/models" },
     { page: "users", label: "用户管理", icon: "users", hash: "#/users" },

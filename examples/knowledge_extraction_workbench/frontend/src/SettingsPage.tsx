@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api, jsonBody, upload } from "./api";
 import { Button, EmptyState, Icon, Notice, StatusBadge, formatDate } from "./components";
+import { modelAdapterLabel } from "./modelAdapters";
 import type {
   AbilityMount,
   AbilityParams,
@@ -181,7 +182,7 @@ export function SettingsPage() {
               >
                 {enabledModels.length === 0 && <option value="">暂无可用模型</option>}
                 {enabledModels.map((model) => (
-                  <option key={model.id} value={model.id}>{model.name} · {model.provider}</option>
+                  <option key={model.id} value={model.id}>{model.name} · {modelAdapterLabel(model.provider)}</option>
                 ))}
               </select>
             </label>
@@ -204,7 +205,7 @@ export function SettingsPage() {
 
       {notice && <Notice tone={notice.tone}>{notice.text}<button onClick={() => setNotice(null)}>关闭</button></Notice>}
       {tab === "agents" && enabledModels.length === 0 && (
-        <Notice tone="warning">尚未接入可用的真实模型，请先在“模型接入”中保存并测试一个 Provider 连接。</Notice>
+        <Notice tone="warning">尚未接入可用的真实模型，请先在“模型接入”中保存并测试一个调用适配器连接。</Notice>
       )}
 
       <div className="page-tabs settings-tabs">

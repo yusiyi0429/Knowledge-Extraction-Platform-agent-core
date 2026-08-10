@@ -71,9 +71,25 @@ test("直接新建场景，完成萃取、建议、五类资产、发布与归�
 
   await page.getByRole("button", { name: "进入资产生成" }).click();
   await page.getByRole("button", { name: "生成五类资产" }).click();
-  await expect(page.getByRole("heading", { name: "交付资产已齐备" })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("heading", { name: "资产生成已完成，待确认发布" })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText("任务已完成", { exact: true })).toBeVisible();
   await expect(page.getByText("合成评测集", { exact: false })).toBeVisible();
   await expect(page.getByText("待评测", { exact: true })).toBeVisible();
+  await expect(page.getByRole("link", { name: "下载全部" })).toHaveAttribute("href", /\/api\/v1\/rounds\/.+\/assets\/download/);
+
+  const rulesAsset = page.locator("article").filter({ has: page.getByRole("heading", { name: "规则清单", exact: true }) });
+  await rulesAsset.getByRole("button", { name: "预览" }).click();
+  await expect(page.getByRole("heading", { name: "规则清单预览" })).toBeVisible();
+  await expect(page.getByRole("columnheader", { name: "规则ID" })).toBeVisible();
+  await page.getByRole("button", { name: "关闭预览" }).click();
+
+  const skillAsset = page.locator("article").filter({ has: page.getByRole("heading", { name: "openJiuwen Skill", exact: true }) });
+  await skillAsset.getByRole("button", { name: "预览" }).click();
+  await expect(page.getByRole("heading", { name: "openJiuwen Skill预览" })).toBeVisible();
+  await expect(page.getByText("Skill 包目录", { exact: true })).toBeVisible();
+  await expect(page.getByText("references/knowledge.md", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "关闭预览" }).click();
+
   await page.getByRole("button", { name: "确认发布" }).click();
   await expect(page.getByRole("heading", { name: "v1 已发布" })).toBeVisible();
 
@@ -81,7 +97,7 @@ test("直接新建场景，完成萃取、建议、五类资产、发布与归�
   await page.getByRole("button", { name: "新增模型" }).click();
   const modelConnectionName = `浏览器密钥边界-${testInfo.project.name}`;
   await page.getByLabel(/连接名称/).fill(modelConnectionName);
-  await page.getByLabel(/Provider/).selectOption("OpenAI");
+  await page.getByLabel(/调用适配器/).selectOption("OpenAI");
   await page.getByLabel(/模型名称/).fill("openai-compatible-test-model");
   await page.getByLabel(/API 地址/).fill("https://example.invalid/v1");
   await page.getByLabel(/API Key/).fill("e2e-secret-must-never-return");
@@ -103,6 +119,26 @@ test("直接新建场景，完成萃取、建议、五类资产、发布与归�
     buffer: unsafeSkillZip,
   });
   await expect(page.getByRole("alert")).toContainText("Skill 包包含不安全路径。");
+
+  await page.getByTitle("运行与评测").click();
+  await expect(page.getByRole("heading", { name: "智能体运行与评测" })).toBeVisible();
+  await expect(page.getByLabel("运行配置")).toContainText(sceneName);
+  await page.getByPlaceholder(/描述一个业务案例/).fill("一笔资料不完整且超过预算的差旅申请应如何处理？");
+  await page.getByRole("button", { name: "发送试跑" }).click();
+  await expect(page.getByRole("heading", { name: "完整回答" })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByText("本次未触发人工复核", { exact: true })).toBeVisible();
+
+  await page.getByRole("button", { name: /真实评测/ }).click();
+  await page.getByRole("button", { name: "开始真实评测" }).click();
+  await expect(page.getByRole("heading", { name: "评测报告" })).toBeVisible({ timeout: 25_000 });
+  await expect(page.getByText("总准确率", { exact: true })).toBeVisible();
+  const feedbackButton = page.getByRole("button", { name: /条错例送去分析/ });
+  await expect(feedbackButton).toBeVisible();
+  await feedbackButton.click();
+  await expect(page.getByRole("heading", { name: "错例分析与回流" })).toBeVisible();
+  await expect(page.getByRole("button", { name: "开始 AI 初判" })).toBeEnabled();
+  await page.getByRole("button", { name: "开始 AI 初判" }).click();
+  await expect(page.getByText("业务专家修订", { exact: true }).first()).toBeVisible({ timeout: 25_000 });
 
   await page.getByTitle("工作台").click();
   const sceneCard = page.locator("article.scene-card").filter({ hasText: sceneName });

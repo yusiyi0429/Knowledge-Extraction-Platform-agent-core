@@ -210,3 +210,43 @@ class AbilityProfile(SQLModel, table=True):
     skill_version_id: Optional[str] = Field(default=None, foreign_key="skillversion.id")
     params_json: str = Field(default="{}", sa_column=Column(Text))
     updated_at: datetime = Field(default_factory=utc_now)
+
+
+class EvaluationRun(SQLModel, table=True):
+    """A frozen evaluation experiment for one published scene Skill."""
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    round_id: str = Field(foreign_key="extractionround.id", index=True)
+    model_connection_id: str = Field(foreign_key="modelconnection.id", index=True)
+    job_id: Optional[str] = Field(default=None, foreign_key="job.id", index=True)
+    dataset_name: str = Field(max_length=255)
+    dataset_kind: str = Field(default="GENERATED", max_length=24)
+    dataset_path: str = Field(sa_column=Column(Text))
+    dataset_sha256: str = Field(max_length=64)
+    status: str = Field(default="QUEUED", index=True, max_length=24)
+    sample_count: int = Field(default=0, ge=0)
+    correct_count: int = Field(default=0, ge=0)
+    review_count: int = Field(default=0, ge=0)
+    accuracy: Optional[float] = Field(default=None, ge=0, le=1)
+    results_json: str = Field(default="[]", sa_column=Column(Text))
+    created_at: datetime = Field(default_factory=utc_now)
+    completed_at: Optional[datetime] = Field(default=None)
+
+
+class FeedbackTask(SQLModel, table=True):
+    """A batch of wrong examples reviewed before being fed into a new round."""
+
+    id: str = Field(default_factory=new_id, primary_key=True)
+    round_id: str = Field(foreign_key="extractionround.id", index=True)
+    model_connection_id: str = Field(foreign_key="modelconnection.id", index=True)
+    job_id: Optional[str] = Field(default=None, foreign_key="job.id", index=True)
+    name: str = Field(max_length=160)
+    task_type: str = Field(default="CLASSIFICATION", max_length=24)
+    status: str = Field(default="DRAFT", index=True, max_length=24)
+    source_filename: str = Field(default="", max_length=255)
+    source_path: str = Field(default="", sa_column=Column(Text))
+    source_sha256: str = Field(default="", max_length=64)
+    cases_json: str = Field(default="[]", sa_column=Column(Text))
+    promoted_round_id: Optional[str] = Field(default=None, foreign_key="extractionround.id", index=True)
+    created_at: datetime = Field(default_factory=utc_now)
+    updated_at: datetime = Field(default_factory=utc_now)

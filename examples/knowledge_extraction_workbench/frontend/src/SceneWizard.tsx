@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { ApiError, api, jsonBody, upload, watchJob } from "./api";
-import { Button, EmptyState, Icon, Notice, StatusBadge, formatBytes, formatDate } from "./components";
-import type { Asset, Job, JobEvent, KnowledgeDocument, Material, Revision, Round, SceneDetail, Suggestion } from "./types";
+import { Button, EmptyState, Icon, Modal, Notice, StatusBadge, formatBytes, formatDate } from "./components";
+import type { Asset, AssetPreview, Job, JobEvent, KnowledgeDocument, Material, Revision, Round, SceneDetail, Suggestion } from "./types";
 
 const assetMeta: Record<string, { title: string; detail: string; icon: "book" | "brain" | "spark" | "file" | "check" }> = {
   RULES_XLSX: { title: "规则清单", detail: "结构化 Excel，可直接审阅与交付", icon: "book" },
@@ -495,8 +495,47 @@ function AlignmentStep({
 }
 
 function JobTimeline({ events }: { events: JobEvent[] }) {
-  const latest = events[events.length - 1];
-  return <div className="job-timeline"><div className="job-bar"><i style={{ width: `${latest?.progress || 0}%` }} /></div>{events.map((event) => <div key={event.seq} className={event.status === "RUNNING" ? "active" : "done"}><span>{event.status === "RUNNING" ? <i className="spinner small" /> : <Icon name="check" size={13} />}</span><b>{event.message}</b><small>{event.progress}%</small></div>)}</div>;
+  const ordered = [...events].sort((left, right) => left.seq - right.seq);
+  const latest = ordered[ordered.length - 1];
+  const terminal = latest?.status === "COMPLETED" || latest?.status === "FAILED";
+  const failed = latest?.status === "FAILED";
+  return (
+    <div className={`job-timeline ${terminal ? failed ? "failed" : "completed" : "running"}`} aria-live="polite">
+      <header className="job-timeline-status">
+        <span>{failed ? <Icon name="warning" size={14} /> : terminal ? <Icon name="check" size={14} /> : <i className="spinner small" />}{failed ? "任务执行失败" : terminal ? "任务已完成" : "任务执行中"}</span>
+        <b>{latest?.progress || 0}%</b>
+      </header>
+      <div className="job-bar"><i style={{ width: `${latest?.progress || 0}%` }} /></div>
+      {ordered.map((event, index) => {
+        const active = !terminal && index === ordered.length - 1 && event.status === "RUNNING";
+        const eventFailed = event.status === "FAILED";
+        return <div key={event.seq} className={eventFailed ? "failed" : active ? "active" : "done"}><span>{eventFailed ? <Icon name="warning" size={13} /> : active ? <i className="spinner small" /> : <Icon name="check" size={13} />}</span><b>{event.message}</b><small>{event.status === "COMPLETED" ? "已完成" : `${event.progress}%`}</small></div>;
+      })}
+    </div>
+  );
+}
+
+function AssetPreviewContent({ preview }: { preview: AssetPreview }) {
+  return (
+    <div className={`asset-preview asset-preview-${preview.mode}`}>
+      {preview.mode === "table" && (
+        <div className="asset-preview-table-wrap">
+          <table><thead><tr>{preview.columns?.map((column, index) => <th key={`${column}-${index}`}>{column || `第 ${index + 1} 列`}</th>)}</tr></thead><tbody>{preview.rows?.map((row, rowIndex) => <tr key={rowIndex}>{row.map((value, cellIndex) => <td key={cellIndex}>{value === null ? "—" : String(value)}</td>)}</tr>)}</tbody></table>
+        </div>
+      )}
+      {preview.mode === "markdown" && <pre className="asset-preview-document">{preview.text || "文件内容为空。"}</pre>}
+      {preview.mode === "archive" && (
+        <div className="asset-preview-archive">
+          <section><h3>Skill 包目录</h3><div className="archive-entry-list">{preview.entries?.map((entry) => <div key={entry.path}><Icon name="file" size={14} /><span>{entry.path}</span><small>{formatBytes(entry.size_bytes)}</small></div>)}</div></section>
+          <section><h3>SKILL.md</h3><pre className="asset-preview-document">{preview.text || "包内未找到可预览的 SKILL.md。"}</pre></section>
+        </div>
+      )}
+      {preview.mode === "jsonl" && (
+        <div className="jsonl-preview-list">{preview.items?.map((item, index) => <article key={index}><span>记录 {String(index + 1).padStart(2, "0")}</span><pre>{JSON.stringify(item, null, 2)}</pre></article>)}</div>
+      )}
+      {preview.truncated && <p className="preview-truncated">为保证页面流畅，仅展示前一部分内容；下载文件可查看完整资产。</p>}
+    </div>
+  );
 }
 
 function AssetsStep({
@@ -518,8 +557,12 @@ function AssetsStep({
 }) {
   const [busy, setBusy] = useState(false);
   const [events, setEvents] = useState<JobEvent[]>([]);
+  const [previewAsset, setPreviewAsset] = useState<Asset | null>(null);
+  const [preview, setPreview] = useState<AssetPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
   const latest = useMemo(() => Object.fromEntries(assets.map((asset) => [asset.kind, asset])), [assets]);
   const complete = Object.keys(assetMeta).every((kind) => latest[kind] && !latest[kind].stale);
+  const readyCount = Object.keys(assetMeta).filter((kind) => latest[kind] && !latest[kind].stale).length;
 
   function observe(job: Job, success: string) {
     setEvents([]);
@@ -554,20 +597,43 @@ function AssetsStep({
     }
   }
 
+  async function openPreview(asset: Asset) {
+    setPreviewAsset(asset);
+    setPreview(null);
+    setPreviewLoading(true);
+    try {
+      setPreview(await api<AssetPreview>(`/assets/${asset.id}/preview`));
+    } catch (error) {
+      setNotice({ tone: "danger", text: messageOf(error) });
+      setPreviewAsset(null);
+    } finally {
+      setPreviewLoading(false);
+    }
+  }
+
+  function closePreview() {
+    setPreviewAsset(null);
+    setPreview(null);
+  }
+
   return (
     <div className="step-pane assets-pane">
       <div className="pane-heading"><p>Step 03 · 知识生成及发布</p><h2>把审定知识转成交付资产</h2><span>规则、研判链和 Skill 由规范化 JSON 确定性生成；QA 与评测样本保留来源。</span></div>
       {!document ? <EmptyState icon="book" title="尚无可生成文档" detail="返回知识萃取与对齐，完成第一版研判文档后再生成资产。" /> : (
         <>
-          <section className="asset-summary"><div className="asset-ring" style={{ "--progress": `${Object.keys(latest).length / 5 * 360}deg` } as React.CSSProperties}><span><b>{Object.keys(latest).length}</b>/5</span></div><div><h3>{complete ? "交付资产已齐备" : "准备生成交付资产"}</h3><p>文档 revision {document.revision} · 规则 {document.structured.rules.length} 条 · 评测状态：<b>待评测</b></p></div><Button kind="primary" icon="spark" onClick={() => void generate()} disabled={busy || published}>{busy ? "生成中…" : assets.length ? "重新生成全部" : "生成五类资产"}</Button></section>
+          <section className="asset-summary"><div className="asset-ring" style={{ "--progress": `${readyCount / 5 * 360}deg` } as React.CSSProperties}><span><b>{readyCount}</b>/5</span></div><div><h3>{published ? `v${round.version} 资产已发布` : complete ? "资产生成已完成，待确认发布" : "准备生成交付资产"}</h3><p>文档 revision {document.revision} · 规则 {document.structured.rules.length} 条 · 评测状态：<b>待评测</b></p></div><Button kind="primary" icon="spark" onClick={() => void generate()} disabled={busy || published}>{busy ? "生成中…" : assets.length ? "重新生成全部" : "生成五类资产"}</Button></section>
           {events.length > 0 && <JobTimeline events={events} />}
+          <div className="asset-section-title"><div><strong>生成的知识资产</strong><span>{complete ? "五类当前版本资产可预览、单独下载或整包下载" : "生成完成后可整包下载"}</span></div>{complete ? <a className="button button-ghost" href={`/api/v1/rounds/${round.id}/assets/download`} download><Icon name="download" size={15} />下载全部</a> : <button className="button button-ghost" disabled><Icon name="download" size={15} />下载全部</button>}</div>
           <section className="asset-grid">
             {Object.entries(assetMeta).map(([kind, meta], index) => {
               const asset = latest[kind];
-              return <article className={asset && !asset.stale ? "ready" : ""} key={kind}><span className="asset-index">0{index + 1}</span><span className="asset-icon"><Icon name={meta.icon} size={22} /></span><div><h3>{meta.title}{kind === "EVAL_JSONL" && <em>合成</em>}</h3><p>{meta.detail}</p>{asset && <small className={asset.stale ? "stale" : ""}>{asset.stale ? "文档已修订，需重新生成" : `v${asset.version} · revision ${asset.source_revision} · ${formatBytes(asset.size_bytes)} · ${formatDate(asset.created_at)}`}</small>}</div><footer>{asset ? <><a className="button button-ghost" href={asset.download_url}><Icon name="download" size={15} />下载</a>{!published && <button className="icon-button" aria-label={`重新生成${meta.title}`} onClick={() => void generate(kind)} disabled={busy}><Icon name="refresh" size={15} /></button>}</> : <span>待生成</span>}</footer></article>;
+              return <article className={asset && !asset.stale ? "ready" : ""} key={kind}><span className="asset-index">0{index + 1}</span><span className="asset-icon"><Icon name={meta.icon} size={22} /></span><div><h3>{meta.title}{kind === "EVAL_JSONL" && <em>合成</em>}</h3><p>{meta.detail}</p>{asset && <small className={asset.stale ? "stale" : ""}>{asset.stale ? "文档已修订，需重新生成" : `v${asset.version} · revision ${asset.source_revision} · ${formatBytes(asset.size_bytes)} · ${formatDate(asset.created_at)}`}</small>}</div><footer>{asset ? <><a className="button button-ghost" href={asset.download_url}><Icon name="download" size={15} />下载</a><Button icon="eye" onClick={() => void openPreview(asset)}>预览</Button>{!published && <button className="icon-button" aria-label={`重新生成${meta.title}`} onClick={() => void generate(kind)} disabled={busy}><Icon name="refresh" size={15} /></button>}</> : <span>待生成</span>}</footer></article>;
             })}
           </section>
           <section className="publish-card"><div><span className="publish-icon"><Icon name={published ? "check" : "upload"} size={22} /></span><div><h3>{published ? `v${round.version} 已发布` : "发布当前萃取轮次"}</h3><p>{published ? "该轮次的文档、素材与资产已锁定；继续工作请创建新一轮。" : "发布后当前轮次不可修改，历史素材、修订和资产永久保留。"}</p></div></div>{published ? <Button kind="primary" icon="plus" onClick={() => void onNewRound()}>创建新一轮</Button> : <Button kind="primary" icon="upload" onClick={() => void publish()} disabled={!complete || busy}>确认发布</Button>}</section>
+          <Modal open={Boolean(previewAsset)} title={`${previewAsset ? assetMeta[previewAsset.kind]?.title || previewAsset.filename : "资产"}预览`} subtitle={previewAsset ? `${previewAsset.filename} · v${previewAsset.version} · revision ${previewAsset.source_revision}` : undefined} onClose={closePreview} wide footer={previewAsset ? <><a className="button button-ghost" href={previewAsset.download_url}><Icon name="download" size={15} />下载此资产</a><Button kind="primary" onClick={closePreview}>关闭预览</Button></> : undefined}>
+            {previewLoading ? <div className="asset-preview-loading"><span className="spinner" />正在读取资产内容…</div> : preview ? <AssetPreviewContent preview={preview} /> : null}
+          </Modal>
         </>
       )}
     </div>

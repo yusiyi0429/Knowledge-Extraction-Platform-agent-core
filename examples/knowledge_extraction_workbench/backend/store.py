@@ -156,6 +156,12 @@ DEFAULT_SKILLS = (
         "description": "从留出案例或审定规则构造测试集，标记合成数据并避免训练评测泄漏。",
         "version": "1.1.0",
     },
+    {
+        "slug": "feedback-analysis",
+        "name": "错例分析与回流 Skill",
+        "description": "为判别式与生成式任务提供错因分析、专家修订和知识缺口回流的通用方法。",
+        "version": "1.0.0",
+    },
 )
 
 

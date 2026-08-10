@@ -16,9 +16,11 @@ from .models import (
     AbilityProfile,
     AbilityMount,
     Asset,
+    EvaluationRun,
     Exploration,
     ExplorationCandidate,
     ExtractionRound,
+    FeedbackTask,
     Job,
     KnowledgeDocument,
     Material,
@@ -27,6 +29,7 @@ from .models import (
     Scene,
     SkillVersion,
     Suggestion,
+    new_id,
     utc_now,
 )
 from .model_runtime import OpenJiuwenKnowledgeModel
@@ -157,6 +160,360 @@ class WorkbenchService:
             api_key=self.secret_box.decrypt(encrypted_key),
             temperature=float(params.get("temperature", 0.2)),
         )
+
+    def _freeze_runtime_model(self, model_id: str) -> dict[str, Any]:
+        with self.store.session() as session:
+            model = session.get(ModelConnection, model_id)
+            if model is None:
+                raise WorkbenchError("MODEL_NOT_FOUND", "模型连接不存在。", status=404)
+            if not model.enabled:
+                raise WorkbenchError("MODEL_DISABLED", "所选模型连接已停用。", status=422)
+            if not model.encrypted_api_key and self._test_model is None:
+                raise WorkbenchError("MODEL_API_KEY_REQUIRED", "所选模型连接没有可用 API Key。", status=422)
+            return {
+                "id": model.id,
+                "name": model.name,
+                "provider": model.provider,
+                "api_base": model.api_base,
+                "model_name": model.model_name,
+                "enabled": model.enabled,
+                "credential_ciphertext": model.encrypted_api_key,
+                "updated_at": model.updated_at.isoformat(),
+            }
+
+    def _runtime_for_model(self, snapshot: dict[str, Any]) -> Any:
+        if self._test_model is not None:
+            return self._test_model
+        model = snapshot.get("model") if isinstance(snapshot.get("model"), dict) else None
+        if not model:
+            raise WorkbenchError("MODEL_MOUNT_REQUIRED", "请选择一个可用模型连接。", status=422)
+        if not model.get("enabled", True):
+            raise WorkbenchError("MODEL_DISABLED", "所选模型连接已停用。", status=422)
+        encrypted_key = str(model.get("credential_ciphertext", ""))
+        if not encrypted_key:
+            raise WorkbenchError("MODEL_API_KEY_REQUIRED", "所选模型连接没有可用 API Key。", status=422)
+        return OpenJiuwenKnowledgeModel(
+            provider=str(model["provider"]),
+            api_base=str(model.get("api_base", "")),
+            model_name=str(model["model_name"]),
+            api_key=self.secret_box.decrypt(encrypted_key),
+            temperature=0.1,
+        )
+
+    def _published_document(self, round_id: str) -> tuple[ExtractionRound, Scene, KnowledgeDocument]:
+        with self.store.session() as session:
+            round_row = session.get(ExtractionRound, round_id)
+            if round_row is None:
+                raise WorkbenchError("ROUND_NOT_FOUND", "萃取轮次不存在。", status=404)
+            if round_row.status != "PUBLISHED":
+                raise WorkbenchError("PUBLISHED_SKILL_REQUIRED", "运行与评测只能选择已发布 Skill。", status=409)
+            scene = session.get(Scene, round_row.scene_id)
+            document = session.exec(select(KnowledgeDocument).where(KnowledgeDocument.round_id == round_id)).first()
+            if scene is None or document is None:
+                raise WorkbenchError("DOCUMENT_REQUIRED", "已发布轮次缺少知识文档。", status=409)
+            session.expunge(round_row)
+            session.expunge(scene)
+            session.expunge(document)
+            return round_row, scene, document
+
+    async def run_tryout(self, round_id: str, model_id: str, input_text: str) -> dict[str, Any]:
+        if not input_text.strip():
+            raise WorkbenchError("TRYOUT_INPUT_REQUIRED", "请输入业务描述或上传资料。", status=422)
+        round_row, scene, document = self._published_document(round_id)
+        model = self._freeze_runtime_model(model_id)
+        runtime = self._runtime_for_model({"model": model})
+        result = await runtime.run_business_case(
+            json.loads(document.structured_json or "{}"),
+            input_text.strip(),
+        )
+        return {
+            "scene_id": scene.id,
+            "round_id": round_row.id,
+            "skill_name": f"{scene.name} v{round_row.version}",
+            "model_name": model["name"],
+            **result,
+        }
+
+    def start_evaluation(
+        self,
+        *,
+        round_id: str,
+        model_id: str,
+        dataset_name: str,
+        dataset_kind: str,
+        dataset_path: str,
+        dataset_sha256: str,
+        cases: list[dict[str, Any]],
+    ) -> tuple[EvaluationRun, Job]:
+        round_row, scene, document = self._published_document(round_id)
+        if not cases:
+            raise WorkbenchError("EVALUATION_DATASET_EMPTY", "测试集没有可用样本。", status=422)
+        if len(cases) > 100:
+            raise WorkbenchError("EVALUATION_DATASET_TOO_LARGE", "单次评测最多支持 100 条样本。", status=422)
+        model = self._freeze_runtime_model(model_id)
+        evaluation = EvaluationRun(
+            round_id=round_id,
+            model_connection_id=model_id,
+            dataset_name=dataset_name[:255],
+            dataset_kind=dataset_kind[:24],
+            dataset_path=dataset_path,
+            dataset_sha256=dataset_sha256,
+            status="QUEUED",
+            sample_count=len(cases),
+        )
+        with self.store.session() as session:
+            session.add(evaluation)
+            session.commit()
+            session.refresh(evaluation)
+            session.expunge(evaluation)
+        job = self._new_job(
+            kind="EVALUATION",
+            scene_id=scene.id,
+            round_id=round_row.id,
+            frozen_config={
+                "template_version": "knowledge-evaluation/v1",
+                "evaluation_id": evaluation.id,
+                "document_revision": document.revision,
+                "document_sha256": hashlib.sha256(document.markdown.encode()).hexdigest(),
+                "model": model,
+                "dataset": {
+                    "name": dataset_name,
+                    "kind": dataset_kind,
+                    "path": dataset_path,
+                    "sha256": dataset_sha256,
+                    "cases": cases,
+                },
+            },
+        )
+        with self.store.session() as session:
+            stored = session.get(EvaluationRun, evaluation.id)
+            if stored:
+                stored.job_id = job.id
+                session.add(stored)
+                session.commit()
+                session.refresh(stored)
+                session.expunge(stored)
+                evaluation = stored
+        self._spawn(job)
+        return evaluation, job
+
+    def create_feedback_task(
+        self,
+        *,
+        round_id: str,
+        model_id: str,
+        name: str,
+        task_type: str,
+        cases: list[dict[str, Any]] | None = None,
+        source_filename: str = "",
+    ) -> FeedbackTask:
+        self._published_document(round_id)
+        self._freeze_runtime_model(model_id)
+        normalized_type = task_type.upper()
+        if normalized_type not in {"CLASSIFICATION", "GENERATION"}:
+            raise WorkbenchError("FEEDBACK_TASK_TYPE_INVALID", "分析格式必须是判别式或生成式。", status=422)
+        task = FeedbackTask(
+            round_id=round_id,
+            model_connection_id=model_id,
+            name=(name.strip() or "未命名错例分析")[:160],
+            task_type=normalized_type,
+            source_filename=source_filename[:255],
+            cases_json=json.dumps(cases or [], ensure_ascii=False),
+        )
+        with self.store.session() as session:
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            session.expunge(task)
+        return task
+
+    def replace_feedback_cases(
+        self,
+        task_id: str,
+        cases: list[dict[str, Any]],
+        *,
+        source_filename: str = "",
+        source_path: str = "",
+        source_sha256: str = "",
+    ) -> FeedbackTask:
+        if not cases:
+            raise WorkbenchError("FEEDBACK_CASES_EMPTY", "错例文件没有可用案例。", status=422)
+        if len(cases) > 100:
+            raise WorkbenchError("FEEDBACK_CASES_TOO_LARGE", "单次分析最多支持 100 条错例。", status=422)
+        with self.store.session() as session:
+            task = session.get(FeedbackTask, task_id)
+            if task is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            if task.status in {"ANALYZING", "PROMOTED"}:
+                raise WorkbenchError("FEEDBACK_TASK_CONFLICT", "当前任务状态不允许替换错例。", status=409)
+            task.cases_json = json.dumps(cases, ensure_ascii=False)
+            task.source_filename = source_filename[:255]
+            task.source_path = source_path
+            task.source_sha256 = source_sha256
+            task.status = "DRAFT"
+            task.updated_at = utc_now()
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            session.expunge(task)
+            return task
+
+    def start_feedback_analysis(self, task_id: str) -> tuple[FeedbackTask, Job]:
+        with self.store.session() as session:
+            task = session.get(FeedbackTask, task_id)
+            if task is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            if task.status == "ANALYZING":
+                raise WorkbenchError("FEEDBACK_TASK_CONFLICT", "错例正在分析中。", status=409)
+            cases = json.loads(task.cases_json or "[]")
+            round_id = task.round_id
+            model_id = task.model_connection_id
+            task_type = task.task_type
+            session.expunge(task)
+        if not isinstance(cases, list) or not cases:
+            raise WorkbenchError("FEEDBACK_CASES_EMPTY", "请先上传或导入错例。", status=422)
+        round_row, scene, document = self._published_document(round_id)
+        model = self._freeze_runtime_model(model_id)
+        job = self._new_job(
+            kind="FEEDBACK_ANALYSIS",
+            scene_id=scene.id,
+            round_id=round_row.id,
+            frozen_config={
+                "template_version": "knowledge-feedback/v1",
+                "feedback_task_id": task_id,
+                "document_revision": document.revision,
+                "document_sha256": hashlib.sha256(document.markdown.encode()).hexdigest(),
+                "model": model,
+                "task_type": task_type,
+                "cases": cases,
+            },
+        )
+        with self.store.session() as session:
+            stored = session.get(FeedbackTask, task_id)
+            if stored is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            stored.job_id = job.id
+            stored.status = "ANALYZING"
+            stored.updated_at = utc_now()
+            session.add(stored)
+            session.commit()
+            session.refresh(stored)
+            session.expunge(stored)
+            task = stored
+        self._spawn(job)
+        return task, job
+
+    def save_feedback_cases(self, task_id: str, cases: list[dict[str, Any]]) -> FeedbackTask:
+        with self.store.session() as session:
+            task = session.get(FeedbackTask, task_id)
+            if task is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            if task.status in {"ANALYZING", "PROMOTED"}:
+                raise WorkbenchError("FEEDBACK_TASK_CONFLICT", "当前任务状态不允许保存修订。", status=409)
+            if not cases:
+                raise WorkbenchError("FEEDBACK_CASES_EMPTY", "任务中没有可保存的错例。", status=422)
+            task.cases_json = json.dumps(cases, ensure_ascii=False)
+            task.status = "READY" if all(bool(item.get("expert_confirmed")) for item in cases) else "REVIEW"
+            task.updated_at = utc_now()
+            session.add(task)
+            session.commit()
+            session.refresh(task)
+            session.expunge(task)
+            return task
+
+    def promote_feedback_task(self, task_id: str) -> tuple[FeedbackTask, ExtractionRound, Scene]:
+        with self.store.session() as session:
+            task = session.get(FeedbackTask, task_id)
+            if task is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            if task.promoted_round_id:
+                target = session.get(ExtractionRound, task.promoted_round_id)
+                scene = session.get(Scene, target.scene_id) if target else None
+                if target and scene:
+                    session.expunge(task)
+                    session.expunge(target)
+                    session.expunge(scene)
+                    return task, target, scene
+            if task.status != "READY":
+                raise WorkbenchError("FEEDBACK_REVIEW_REQUIRED", "请先完成全部错例的专家确认。", status=409)
+            source_round = session.get(ExtractionRound, task.round_id)
+            if source_round is None:
+                raise WorkbenchError("ROUND_NOT_FOUND", "来源轮次不存在。", status=404)
+            scene = session.get(Scene, source_round.scene_id)
+            latest = session.exec(
+                select(ExtractionRound)
+                .where(ExtractionRound.scene_id == source_round.scene_id)
+                .order_by(ExtractionRound.version.desc())
+            ).first()
+            scene_id = source_round.scene_id
+            cases = json.loads(task.cases_json or "[]")
+            session.expunge(task)
+            if scene:
+                session.expunge(scene)
+            if latest:
+                session.expunge(latest)
+        if latest is None or latest.status == "PUBLISHED":
+            target = self.create_next_round(scene_id)
+        else:
+            target = latest
+        material_id = new_id()
+        target_dir = self.settings.upload_dir / "rounds" / target.id / material_id
+        target_dir.mkdir(parents=True, exist_ok=False)
+        filename = f"错例回流-{task.id[:8]}.md"
+        material_path = target_dir / filename
+        lines = [
+            f"# {task.name}",
+            "",
+            "> 本素材由错例分析与专家修订生成，用于下一轮知识萃取。",
+            "",
+        ]
+        for index, case in enumerate(cases, start=1):
+            expert = case.get("expert", {}) if isinstance(case.get("expert"), dict) else {}
+            lines.extend(
+                [
+                    f"## 错例 {index} · {case.get('summary') or case.get('id') or '未命名'}",
+                    f"- 输入：{case.get('input', '')}",
+                    f"- 原输出：{case.get('original_output', '')}",
+                    f"- 专家结论：{expert.get('correct_label') or expert.get('expected_content') or case.get('expected', '')}",
+                    f"- 错因/问题：{expert.get('error_reason') or expert.get('issues') or ''}",
+                    f"- 正确依据：{expert.get('correct_reason') or ''}",
+                    f"- 知识缺口：{expert.get('knowledge_gap') or ''}",
+                    f"- 归因：{expert.get('attribution') or ''}",
+                    "",
+                ]
+            )
+        content = "\n".join(lines).strip() + "\n"
+        material_path.write_text(content, encoding="utf-8")
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        with self.store.session() as session:
+            material = Material(
+                id=material_id,
+                round_id=target.id,
+                name=filename,
+                role="FEEDBACK",
+                file_path=str(material_path),
+                parsed_path=str(material_path),
+                extension=".md",
+                size_bytes=len(content.encode()),
+                sha256=digest,
+            )
+            session.add(material)
+            stored = session.get(FeedbackTask, task_id)
+            if stored is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            stored.status = "PROMOTED"
+            stored.promoted_round_id = target.id
+            stored.updated_at = utc_now()
+            session.add(stored)
+            session.commit()
+            session.refresh(stored)
+            session.expunge(stored)
+            task = stored
+            scene = session.get(Scene, target.scene_id)
+            if scene is None:
+                raise WorkbenchError("SCENE_NOT_FOUND", "场景不存在。", status=404)
+            session.expunge(scene)
+        return task, target, scene
 
     @staticmethod
     def _mount_params(snapshot: dict[str, Any], ability_key: str) -> dict[str, Any]:
@@ -455,6 +812,10 @@ class WorkbenchService:
                 await self._run_extraction(job)
             elif job.kind == "ASSET_GENERATION":
                 await self._run_asset_generation(job)
+            elif job.kind == "EVALUATION":
+                await self._run_evaluation(job)
+            elif job.kind == "FEEDBACK_ANALYSIS":
+                await self._run_feedback_analysis(job)
             else:
                 raise WorkbenchError("JOB_KIND_UNSUPPORTED", "不支持的任务类型。", status=422)
         except asyncio.CancelledError:
@@ -474,6 +835,24 @@ class WorkbenchService:
             self._reset_failed_scope(job)
 
     def _reset_failed_scope(self, job: Job) -> None:
+        snapshot = json.loads(job.frozen_config_json or "{}")
+        if job.kind == "EVALUATION" and snapshot.get("evaluation_id"):
+            with self.store.session() as session:
+                evaluation = session.get(EvaluationRun, str(snapshot["evaluation_id"]))
+                if evaluation:
+                    evaluation.status = "FAILED"
+                    session.add(evaluation)
+                    session.commit()
+            return
+        if job.kind == "FEEDBACK_ANALYSIS" and snapshot.get("feedback_task_id"):
+            with self.store.session() as session:
+                task = session.get(FeedbackTask, str(snapshot["feedback_task_id"]))
+                if task:
+                    task.status = "FAILED"
+                    task.updated_at = utc_now()
+                    session.add(task)
+                    session.commit()
+            return
         if not job.round_id:
             return
         with self.store.session() as session:
@@ -696,6 +1075,132 @@ class WorkbenchService:
             job.id, phase="completed", status="COMPLETED", progress=100, message=f"已生成 {len(specs)} 类知识资产"
         )
 
+    async def _run_evaluation(self, job: Job) -> None:
+        snapshot = json.loads(job.frozen_config_json)
+        evaluation_id = str(snapshot["evaluation_id"])
+        cases = snapshot.get("dataset", {}).get("cases", [])
+        runtime = self._runtime_for_model(snapshot)
+        with self.store.session() as session:
+            evaluation = session.get(EvaluationRun, evaluation_id)
+            document = session.exec(select(KnowledgeDocument).where(KnowledgeDocument.round_id == job.round_id)).first()
+            if evaluation is None or document is None:
+                raise WorkbenchError("EVALUATION_NOT_FOUND", "评测实验或知识文档不存在。", status=404)
+            if hashlib.sha256(document.markdown.encode()).hexdigest() != snapshot["document_sha256"]:
+                raise WorkbenchError("DOCUMENT_REVISION_CONFLICT", "评测引用的发布文档已变化。", status=409)
+            evaluation.status = "RUNNING"
+            session.add(evaluation)
+            session.commit()
+            structured = json.loads(document.structured_json or "{}")
+        self.store.record_job_event(
+            job.id, phase="evaluating", status="RUNNING", progress=12, message=f"正在逐条运行 {len(cases)} 条测试样本"
+        )
+        results: list[dict[str, Any]] = []
+        semaphore = asyncio.Semaphore(2)
+
+        async def _evaluate(index: int, case: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                output = await runtime.run_business_case(
+                    structured,
+                    str(case.get("input", "")),
+                    expected=str(case.get("expected", "")),
+                )
+                return {
+                    "id": str(case.get("id") or f"C-{index + 1:03d}"),
+                    "input": str(case.get("input", "")),
+                    "expected": str(case.get("expected", "")),
+                    "source_refs": case.get("source_refs", []),
+                    **output,
+                }
+
+        pending = [asyncio.create_task(_evaluate(index, case)) for index, case in enumerate(cases)]
+        for done, future in enumerate(asyncio.as_completed(pending), start=1):
+            results.append(await future)
+            progress = 12 + round(done / len(cases) * 74)
+            self.store.record_job_event(
+                job.id,
+                phase="evaluating",
+                status="RUNNING",
+                progress=progress,
+                message=f"已完成 {done}/{len(cases)} 条样本",
+            )
+        results.sort(key=lambda item: item["id"])
+        correct_count = sum(1 for item in results if item.get("correct") is True)
+        review_count = sum(1 for item in results if item.get("review_required"))
+        with self.store.session() as session:
+            evaluation = session.get(EvaluationRun, evaluation_id)
+            if evaluation is None:
+                raise WorkbenchError("EVALUATION_NOT_FOUND", "评测实验不存在。", status=404)
+            evaluation.status = "COMPLETED"
+            evaluation.correct_count = correct_count
+            evaluation.review_count = review_count
+            evaluation.accuracy = correct_count / len(results) if results else None
+            evaluation.results_json = json.dumps(results, ensure_ascii=False)
+            evaluation.completed_at = utc_now()
+            session.add(evaluation)
+            session.commit()
+        self.store.record_job_event(
+            job.id,
+            phase="completed",
+            status="COMPLETED",
+            progress=100,
+            message=f"评测完成：{correct_count}/{len(results)} 条符合标准答案",
+        )
+
+    async def _run_feedback_analysis(self, job: Job) -> None:
+        snapshot = json.loads(job.frozen_config_json)
+        task_id = str(snapshot["feedback_task_id"])
+        cases = snapshot.get("cases", [])
+        runtime = self._runtime_for_model(snapshot)
+        with self.store.session() as session:
+            document = session.exec(select(KnowledgeDocument).where(KnowledgeDocument.round_id == job.round_id)).first()
+            if document is None:
+                raise WorkbenchError("DOCUMENT_REQUIRED", "已发布知识文档不存在。", status=409)
+            structured = json.loads(document.structured_json or "{}")
+        self.store.record_job_event(
+            job.id, phase="analyzing", status="RUNNING", progress=14, message=f"正在初判 {len(cases)} 条错例"
+        )
+        analyzed: list[dict[str, Any]] = []
+        semaphore = asyncio.Semaphore(2)
+
+        async def _analyze(index: int, case: dict[str, Any]) -> dict[str, Any]:
+            async with semaphore:
+                analysis = await runtime.analyze_feedback_case(
+                    structured,
+                    case,
+                    task_type=str(snapshot.get("task_type", "CLASSIFICATION")),
+                )
+                return {
+                    **case,
+                    "id": str(case.get("id") or f"E-{index + 1:03d}"),
+                    "analysis": analysis,
+                    "expert": analysis,
+                    "expert_confirmed": False,
+                }
+
+        pending = [asyncio.create_task(_analyze(index, case)) for index, case in enumerate(cases)]
+        for done, future in enumerate(asyncio.as_completed(pending), start=1):
+            analyzed.append(await future)
+            self.store.record_job_event(
+                job.id,
+                phase="analyzing",
+                status="RUNNING",
+                progress=14 + round(done / len(cases) * 72),
+                message=f"已完成 {done}/{len(cases)} 条初判",
+            )
+        analyzed.sort(key=lambda item: item["id"])
+        with self.store.session() as session:
+            task = session.get(FeedbackTask, task_id)
+            if task is None:
+                raise WorkbenchError("FEEDBACK_TASK_NOT_FOUND", "错例分析任务不存在。", status=404)
+            task.cases_json = json.dumps(analyzed, ensure_ascii=False)
+            task.status = "REVIEW"
+            task.updated_at = utc_now()
+            session.add(task)
+            session.commit()
+        self.store.record_job_event(
+            job.id, phase="completed", status="COMPLETED", progress=100, message="AI 初判完成，请专家逐条确认"
+        )
+
     def retry_job(self, job_id: str) -> Job:
         original = self.store.get(Job, job_id, code="JOB_NOT_FOUND")
         if original.status != "FAILED" or not original.retryable:
@@ -707,6 +1212,24 @@ class WorkbenchService:
             exploration_id=original.exploration_id,
             frozen_config=json.loads(original.frozen_config_json),
         )
+        snapshot = json.loads(original.frozen_config_json or "{}")
+        if original.kind == "EVALUATION" and snapshot.get("evaluation_id"):
+            with self.store.session() as session:
+                evaluation = session.get(EvaluationRun, str(snapshot["evaluation_id"]))
+                if evaluation:
+                    evaluation.job_id = job.id
+                    evaluation.status = "QUEUED"
+                    session.add(evaluation)
+                    session.commit()
+        elif original.kind == "FEEDBACK_ANALYSIS" and snapshot.get("feedback_task_id"):
+            with self.store.session() as session:
+                task = session.get(FeedbackTask, str(snapshot["feedback_task_id"]))
+                if task:
+                    task.job_id = job.id
+                    task.status = "ANALYZING"
+                    task.updated_at = utc_now()
+                    session.add(task)
+                    session.commit()
         self._spawn(job)
         return job
 

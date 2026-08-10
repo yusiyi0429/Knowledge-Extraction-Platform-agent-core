@@ -133,6 +133,22 @@ export interface Asset {
   size_bytes: number;
   created_at: string;
   download_url: string;
+  preview_url: string;
+}
+
+export interface AssetPreview {
+  id: string;
+  kind: string;
+  filename: string;
+  mode: "table" | "markdown" | "archive" | "jsonl";
+  download_url: string;
+  truncated: boolean;
+  sheet?: string;
+  columns?: string[];
+  rows?: Array<Array<string | number | boolean | null>>;
+  text?: string;
+  entries?: Array<{ path: string; size_bytes: number }>;
+  items?: unknown[];
 }
 
 export interface ModelConnection {
@@ -223,4 +239,99 @@ export interface Revision {
   reason: string;
   author: string;
   created_at: string;
+}
+
+export interface RuntimeSkill {
+  id: string;
+  round_id: string;
+  scene_id: string;
+  name: string;
+  version: number;
+  label: string;
+  published_at: string;
+  has_skill_asset: boolean;
+  evaluation_asset: Asset | null;
+}
+
+export interface TryoutResult {
+  scene_id: string;
+  round_id: string;
+  skill_name: string;
+  model_name: string;
+  answer: string;
+  verdict: string;
+  confidence: number;
+  reason: string;
+  matched_rules: string[];
+  decision_path: string[];
+  review_required: boolean;
+}
+
+export interface EvaluationCaseResult extends TryoutResult {
+  id: string;
+  input: string;
+  expected: string;
+  source_refs: SourceRef[];
+  correct: boolean;
+  mismatch_reason: string;
+}
+
+export interface EvaluationRun {
+  id: string;
+  round_id: string;
+  model_connection_id: string;
+  job_id: string | null;
+  dataset_name: string;
+  dataset_kind: "GENERATED" | "UPLOADED";
+  status: string;
+  sample_count: number;
+  correct_count: number;
+  wrong_count: number;
+  review_count: number;
+  accuracy: number | null;
+  results: EvaluationCaseResult[];
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface FeedbackIssue {
+  type: string;
+  description: string;
+}
+
+export interface FeedbackAnalysis {
+  correct_label?: string;
+  error_reason?: string;
+  correct_reason?: string;
+  issues?: FeedbackIssue[];
+  expected_content?: string;
+  knowledge_gap: string;
+  attribution: string;
+}
+
+export interface FeedbackCase {
+  id: string;
+  summary: string;
+  input: string;
+  original_output: string;
+  expected: string;
+  analysis?: FeedbackAnalysis;
+  expert?: FeedbackAnalysis;
+  expert_confirmed?: boolean;
+}
+
+export interface FeedbackTask {
+  id: string;
+  round_id: string;
+  model_connection_id: string;
+  job_id: string | null;
+  name: string;
+  task_type: "CLASSIFICATION" | "GENERATION";
+  status: string;
+  source_filename: string;
+  case_count: number;
+  cases: FeedbackCase[];
+  promoted_round_id: string | null;
+  created_at: string;
+  updated_at: string;
 }

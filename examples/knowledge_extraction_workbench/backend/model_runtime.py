@@ -110,13 +110,13 @@ def model_connection_error(exc: Exception) -> WorkbenchError:
     if any(isinstance(item, BaseError) and item.code in {181000, 181002, 181003, 181005} for item in chain):
         return WorkbenchError(
             "MODEL_CONFIGURATION_INVALID",
-            "模型客户端配置无法初始化，请检查 Provider、地址和本机 TLS 配置。",
+            "模型客户端配置无法初始化，请检查调用适配器、地址和本机 TLS 配置。",
             status=422,
             details={"reason": reason},
         )
     return WorkbenchError(
         "MODEL_REQUEST_FAILED",
-        "模型连接测试失败，请检查 Provider、地址、模型名称和密钥。",
+        "模型连接测试失败，请检查调用适配器、地址、模型名称和密钥。",
         status=502,
         retryable=True,
         details={"reason": reason},
@@ -511,3 +511,136 @@ class OpenJiuwenKnowledgeModel:
         if not normalized:
             raise WorkbenchError("EVALUATION_RESULT_EMPTY", "模型未返回可用评测样本。", status=422, retryable=True)
         return normalized
+
+    @staticmethod
+    def _business_context(structured: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "scene": structured.get("scene", ""),
+            "rules": [
+                {
+                    "id": rule.get("id"),
+                    "title": rule.get("title"),
+                    "condition": rule.get("condition"),
+                    "action": rule.get("action"),
+                    "exceptions": rule.get("exceptions"),
+                }
+                for rule in structured.get("rules", [])[:30]
+                if isinstance(rule, dict)
+            ],
+            "process": structured.get("process", [])[:20],
+            "conflicts": structured.get("conflicts", [])[:10],
+        }
+
+    async def run_business_case(
+        self,
+        structured: dict[str, Any],
+        input_text: str,
+        *,
+        expected: str = "",
+    ) -> dict[str, Any]:
+        evaluation_instruction = (
+            "expected 是专家标准答案。请对 answer 与 expected 做语义比对，并返回 correct 与 mismatch_reason。"
+            if expected
+            else "这是探索性试跑，不要返回虚假的准确率；correct 返回 null。"
+        )
+        payload = await self._invoke_json(
+            (
+                "使用给定业务 Skill 的规则与流程处理 input。只给出可审计的业务结论，不输出隐藏思维过程。"
+                f"{evaluation_instruction} 严格返回对象："
+                '{"answer":"业务结论","verdict":"短标签或结论摘要","confidence":0.0,'
+                '"reason":"判断理由","matched_rules":["R-001"],"decision_path":["步骤说明"],'
+                '"review_required":false,"correct":null,"mismatch_reason":""}。'
+            ),
+            json.dumps(
+                {
+                    "skill": self._business_context(structured),
+                    "input": input_text[:20000],
+                    "expected": expected[:4000],
+                },
+                ensure_ascii=False,
+            ),
+        )
+        if not isinstance(payload, dict) or not str(payload.get("answer", "")).strip():
+            raise WorkbenchError("MODEL_JSON_INVALID", "模型业务运行结果结构无效。", status=422, retryable=True)
+        try:
+            confidence = float(payload.get("confidence", 0.0))
+        except (TypeError, ValueError):
+            confidence = 0.0
+        if confidence > 1:
+            confidence /= 100
+        matched_rules = payload.get("matched_rules", [])
+        decision_path = payload.get("decision_path", [])
+        return {
+            "answer": str(payload["answer"])[:8000],
+            "verdict": str(payload.get("verdict", ""))[:200],
+            "confidence": max(0.0, min(1.0, confidence)),
+            "reason": str(payload.get("reason", ""))[:4000],
+            "matched_rules": [str(item)[:240] for item in matched_rules[:20]] if isinstance(matched_rules, list) else [],
+            "decision_path": [str(item)[:500] for item in decision_path[:20]] if isinstance(decision_path, list) else [],
+            "review_required": bool(payload.get("review_required", False)),
+            "correct": bool(payload.get("correct")) if expected else None,
+            "mismatch_reason": str(payload.get("mismatch_reason", ""))[:2000],
+        }
+
+    async def analyze_feedback_case(
+        self,
+        structured: dict[str, Any],
+        case: dict[str, Any],
+        *,
+        task_type: str,
+    ) -> dict[str, Any]:
+        if task_type == "GENERATION":
+            schema = (
+                '{"issues":[{"type":"遗漏要点","description":"..."}],'
+                '"expected_content":"应有写法","knowledge_gap":"需补齐的知识","attribution":"遗漏要点"}'
+            )
+            guidance = "分析生成内容的问题点、应有写法、知识缺口与主要归因。"
+        else:
+            schema = (
+                '{"correct_label":"正确标签","error_reason":"为什么判错",'
+                '"correct_reason":"正确判断依据","attribution":"规则阈值","knowledge_gap":"应补齐或修正的规则"}'
+            )
+            guidance = "分析判别结果的正确标签、错因、正确原因、归因与知识缺口。"
+        payload = await self._invoke_json(
+            (
+                "你是内置错例分析与回流能力。业务 Skill 只提供业务口径，当前任务只形成可供专家修订的初判。"
+                f"{guidance} 严格返回：{schema}。"
+            ),
+            json.dumps(
+                {
+                    "skill": self._business_context(structured),
+                    "case": {
+                        "input": str(case.get("input", ""))[:20000],
+                        "original_output": str(case.get("original_output", ""))[:10000],
+                        "expected": str(case.get("expected", ""))[:4000],
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+        if not isinstance(payload, dict):
+            raise WorkbenchError("MODEL_JSON_INVALID", "模型错例分析结果结构无效。", status=422, retryable=True)
+        if task_type == "GENERATION":
+            issues = payload.get("issues", [])
+            return {
+                "issues": [
+                    {
+                        "type": str(item.get("type", "其他"))[:80],
+                        "description": str(item.get("description", ""))[:1000],
+                    }
+                    for item in issues[:20]
+                    if isinstance(item, dict) and item.get("description")
+                ]
+                if isinstance(issues, list)
+                else [],
+                "expected_content": str(payload.get("expected_content", ""))[:8000],
+                "knowledge_gap": str(payload.get("knowledge_gap", ""))[:4000],
+                "attribution": str(payload.get("attribution", "其他"))[:80],
+            }
+        return {
+            "correct_label": str(payload.get("correct_label", ""))[:240],
+            "error_reason": str(payload.get("error_reason", ""))[:4000],
+            "correct_reason": str(payload.get("correct_reason", ""))[:4000],
+            "attribution": str(payload.get("attribution", "其他"))[:80],
+            "knowledge_gap": str(payload.get("knowledge_gap", ""))[:4000],
+        }

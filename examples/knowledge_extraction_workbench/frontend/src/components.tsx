@@ -11,8 +11,10 @@ export type IconName =
   | "database"
   | "download"
   | "edit"
+  | "eye"
   | "file"
   | "grid"
+  | "history"
   | "layers"
   | "model"
   | "plus"
@@ -21,6 +23,7 @@ export type IconName =
   | "send"
   | "settings"
   | "spark"
+  | "trend"
   | "upload"
   | "users"
   | "warning";
@@ -36,8 +39,10 @@ const paths: Record<IconName, ReactNode> = {
   database: <><ellipse cx="12" cy="5" rx="8" ry="3"/><path d="M4 5v7c0 1.7 3.6 3 8 3s8-1.3 8-3V5M4 12v7c0 1.7 3.6 3 8 3s8-1.3 8-3v-7"/></>,
   download: <><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 20h16"/></>,
   edit: <><path d="m4 20 4.4-1 10.8-10.8a2 2 0 0 0-2.8-2.8L5.6 16.2z"/><path d="m14.8 7 2.8 2.8"/></>,
+  eye: <><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="2.6"/></>,
   file: <><path d="M6 2h8l4 4v16H6z"/><path d="M14 2v5h5M9 12h6M9 16h6"/></>,
   grid: <><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></>,
+  history: <><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5M12 7v5l3 2"/></>,
   layers: <><path d="m12 3 9 5-9 5-9-5z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></>,
   model: <><rect x="4" y="4" width="16" height="16" rx="3"/><path d="M9 9h6v6H9zM4 10H2M4 14H2M22 10h-2M22 14h-2M10 4V2M14 4V2M10 22v-2M14 22v-2"/></>,
   plus: <path d="M12 5v14M5 12h14"/>,
@@ -46,6 +51,7 @@ const paths: Record<IconName, ReactNode> = {
   send: <><path d="M22 2 11 13"/><path d="m22 2-7 20-4-9-9-4z"/></>,
   settings: <><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.8 1.8 0 0 0 .4 2l.1.1-2.8 2.8-.1-.1a1.8 1.8 0 0 0-2-.4 1.8 1.8 0 0 0-1.1 1.6v.2h-4V21A1.8 1.8 0 0 0 8.8 19.4a1.8 1.8 0 0 0-2 .4l-.1.1-2.8-2.8L4 17a1.8 1.8 0 0 0 .4-2 1.8 1.8 0 0 0-1.6-1.1h-.2v-4h.2A1.8 1.8 0 0 0 4.4 8.8a1.8 1.8 0 0 0-.4-2l-.1-.1 2.8-2.8.1.1a1.8 1.8 0 0 0 2 .4A1.8 1.8 0 0 0 9.9 2.8v-.2h4v.2A1.8 1.8 0 0 0 15 4.4a1.8 1.8 0 0 0 2-.4l.1-.1 2.8 2.8-.1.1a1.8 1.8 0 0 0-.4 2 1.8 1.8 0 0 0 1.6 1.1h.2v4H21a1.8 1.8 0 0 0-1.6 1.1z"/></>,
   spark: <><path d="m12 2 1.5 5.5L19 9l-5.5 1.5L12 16l-1.5-5.5L5 9l5.5-1.5z"/><path d="m19 15 .8 2.2L22 18l-2.2.8L19 21l-.8-2.2L16 18l2.2-.8z"/></>,
+  trend: <><path d="M3 3v18h18"/><path d="m7 15 4-4 3 3 6-7"/></>,
   upload: <><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 20h16"/></>,
   users: <><circle cx="9" cy="8" r="4"/><path d="M2 21v-1a6 6 0 0 1 6-6h2a6 6 0 0 1 6 6v1M16 5.5a3.5 3.5 0 0 1 0 6.8M18 15a5 5 0 0 1 4 5"/></>,
   warning: <><path d="m12 3 10 18H2z"/><path d="M12 9v5M12 18h.01"/></>,
@@ -142,7 +148,9 @@ export function StatusBadge({ status }: { status: string }) {
     FAILED: "失败",
     QUEUED: "排队中",
     RUNNING: "运行中",
+    ANALYZING: "分析中",
     COMPLETED: "已完成",
+    PROMOTED: "已回流",
     ENABLED: "已启用",
   };
   return <span className={`status status-${status.toLowerCase()}`}>{labels[status] || status}</span>;

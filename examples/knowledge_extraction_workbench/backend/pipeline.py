@@ -354,6 +354,51 @@ class DeterministicTestModel:
             for item in qa_items[:10]
         ]
 
+    async def run_business_case(
+        self,
+        structured: dict[str, Any],
+        input_text: str,
+        *,
+        expected: str = "",
+    ) -> dict[str, Any]:
+        rules = structured.get("rules", [])
+        matched = rules[0] if rules else {}
+        answer = str(matched.get("action") or input_text[:160] or "未找到可执行结论")
+        correct = expected.lower() in answer.lower() or answer.lower() in expected.lower() if expected else None
+        return {
+            "answer": answer,
+            "verdict": str(matched.get("title", "规则判断")),
+            "confidence": 0.86,
+            "reason": "依据已发布 Skill 中的首条可用规则形成确定性测试结论。",
+            "matched_rules": [str(matched.get("id", "R-001"))],
+            "decision_path": [str(matched.get("title", "读取规则")), "形成业务结论"],
+            "review_required": False,
+            "correct": correct,
+            "mismatch_reason": "输出与标准答案不一致。" if expected and not correct else "",
+        }
+
+    async def analyze_feedback_case(
+        self,
+        structured: dict[str, Any],
+        case: dict[str, Any],
+        *,
+        task_type: str,
+    ) -> dict[str, Any]:
+        if task_type == "GENERATION":
+            return {
+                "issues": [{"type": "遗漏要点", "description": "原输出未完整覆盖业务规则与例外条件。"}],
+                "expected_content": str(case.get("expected") or "按已发布规则补齐依据与例外条件。"),
+                "knowledge_gap": "补充边界条件和人工复核分支。",
+                "attribution": "遗漏要点",
+            }
+        return {
+            "correct_label": str(case.get("expected") or "待专家确认"),
+            "error_reason": "原输出与专家标准答案或已发布规则不一致。",
+            "correct_reason": "应以已发布规则、例外条件和来源证据为准。",
+            "attribution": "规则缺失",
+            "knowledge_gap": "补充该错例对应的边界规则与正确判断依据。",
+        }
+
 
 def render_markdown(structured: dict[str, Any]) -> str:
     lines = [
