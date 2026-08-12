@@ -380,6 +380,35 @@ async def test_archive_conflict_and_model_secret_never_returns(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_http_model_endpoint_requires_exact_deployment_allowlist(tmp_path, monkeypatch):
+    app = create_test_app(tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    payload = {
+        "name": "内网模型网关",
+        "provider": "OpenAI",
+        "api_base": "http://model-gateway:8000/v1",
+        "model_name": "internal-model",
+        "api_key": "internal-key",
+    }
+    try:
+        rejected = await client.post("/api/v1/models", json=payload)
+        assert rejected.status == 422
+        assert (await rejected.json())["code"] == "MODEL_API_BASE_INVALID"
+
+        monkeypatch.setenv("WORKBENCH_MODEL_HTTP_HOSTS", "model-gateway,192.168.10.20")
+        accepted = await client.post("/api/v1/models", json=payload)
+        assert accepted.status == 201, await accepted.text()
+
+        wildcard_payload = {**payload, "name": "未精确授权的模型", "api_base": "http://other-model:8000/v1"}
+        monkeypatch.setenv("WORKBENCH_MODEL_HTTP_HOSTS", "*")
+        wildcard_rejected = await client.post("/api/v1/models", json=wildcard_payload)
+        assert wildcard_rejected.status == 422
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
 async def test_model_connection_test_passes_strict_tls_config(tmp_path, monkeypatch):
     captured = {}
 

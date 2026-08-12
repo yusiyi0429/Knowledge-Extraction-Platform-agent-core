@@ -7,6 +7,7 @@ import csv
 import hashlib
 import io
 import json
+import os
 import shutil
 import zipfile
 from datetime import datetime
@@ -1522,11 +1523,17 @@ def _validate_model_endpoint(provider: str, api_base: str) -> None:
     parsed = urlparse(api_base)
     if parsed.scheme == "https" and parsed.hostname:
         return
-    if parsed.scheme == "http" and parsed.hostname in {"127.0.0.1", "localhost", "::1"}:
-        return
+    if parsed.scheme == "http" and parsed.hostname:
+        configured_hosts = {
+            item.strip().lower().strip("[]")
+            for item in os.environ.get("WORKBENCH_MODEL_HTTP_HOSTS", "").split(",")
+            if item.strip() and item.strip() != "*"
+        }
+        if parsed.hostname.lower() in {"127.0.0.1", "localhost", "::1", *configured_hosts}:
+            return
     raise WorkbenchError(
         "MODEL_API_BASE_INVALID",
-        "API 地址必须使用 HTTPS；仅本机模型允许 HTTP loopback 地址。",
+        "API 地址必须使用 HTTPS；HTTP 仅允许本机或 WORKBENCH_MODEL_HTTP_HOSTS 中的精确主机。",
         status=422,
     )
 

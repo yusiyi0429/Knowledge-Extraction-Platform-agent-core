@@ -1,0 +1,44 @@
+name: knowledge-extraction-workbench
+
+services:
+  workbench:
+    image: ${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.0}
+    build:
+      context: ../../..
+      dockerfile: examples/knowledge_extraction_workbench/deploy/Dockerfile
+      args:
+        APP_VERSION: ${WORKBENCH_VERSION:-0.1.0}
+    platform: ${WORKBENCH_PLATFORM:-linux/amd64}
+    init: true
+    restart: unless-stopped
+    ports:
+      - "${WORKBENCH_BIND_ADDRESS:-0.0.0.0}:${WORKBENCH_PUBLIC_PORT:-8765}:8765"
+    environment:
+      WORKBENCH_HOST: 0.0.0.0
+      WORKBENCH_PORT: 8765
+      WORKBENCH_DATA_DIR: /var/lib/knowledge-workbench
+      WORKBENCH_MAX_UPLOAD_BYTES: ${WORKBENCH_MAX_UPLOAD_BYTES:-209715200}
+      WORKBENCH_MODEL_HTTP_HOSTS: ${WORKBENCH_MODEL_HTTP_HOSTS:-}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,workbench}
+      TZ: ${TZ:-Asia/Shanghai}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - workbench-data:/var/lib/knowledge-workbench
+    security_opt:
+      - no-new-privileges:true
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/api/v1/health', timeout=3)"
+      interval: 15s
+      timeout: 5s
+      start_period: 20s
+      retries: 5
+
+volumes:
+  workbench-data:

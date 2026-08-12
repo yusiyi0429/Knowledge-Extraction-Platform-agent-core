@@ -58,6 +58,32 @@ npm run dev
 
 开发服务器会把 `/api` 代理到 `127.0.0.1:8765`。
 
+## Docker 与离线部署
+
+工作台提供单容器 Docker 部署，不依赖外部数据库、Nginx、队列或向量库。联网环境可直接构建启动：
+
+```bash
+cd examples/knowledge_extraction_workbench/deploy
+cp .env.example .env
+docker compose --env-file .env up -d --build
+```
+
+对于完全不能访问公网的内网服务器，在联网构建机一次生成 AMD64、ARM64 两种架构的离线包。每个包都包含应用镜像、Compose 配置、SHA-256 校验和启动脚本：
+
+```bash
+examples/knowledge_extraction_workbench/deploy/export-all-offline-bundles.sh
+```
+
+根据服务器 `uname -m` 选择 `dist/knowledge-workbench-offline/` 中的 `linux-amd64` 或 `linux-arm64` 包。以 x86_64 服务器为例：
+
+```bash
+tar -xf knowledge-workbench-offline-0.1.0-linux-amd64.tar
+cd knowledge-workbench-offline
+./start-offline.sh
+```
+
+数据保存在独立 Docker volume，升级容器不会清除。ARM64 构建、内网 HTTP 模型白名单、私有 CA、备份与排障说明见 [deploy/README.md](deploy/README.md)。由于本应用不包含真实认证，暴露 `0.0.0.0:8765` 时必须限制在可信内网。
+
 ## 模型接入
 
 工作台不会创建内置模型。接入真实模型时：
@@ -69,7 +95,7 @@ npm run dev
 
 界面中的“调用适配器”对应 API 的 `provider` 字段，表示底层客户端协议而非服务商品牌。MiniMax、Kimi、GLM、vLLM 等兼容服务应选择“OpenAI 兼容接口”，连接名称用于标识真实服务商或用途。
 
-产品不会把 DeepSeek 或其他模型连接写死为默认；存在多个可用连接时，批量应用必须明确选择模型。外部 API 地址必须使用 HTTPS；HTTP 只允许 `localhost`、`127.0.0.1` 或 `::1`。
+产品不会把 DeepSeek 或其他模型连接写死为默认；存在多个可用连接时，批量应用必须明确选择模型。外部 API 地址必须使用 HTTPS；HTTP 默认只允许 `localhost`、`127.0.0.1` 或 `::1`。内网离线部署可通过 `WORKBENCH_MODEL_HTTP_HOSTS` 精确放行模型网关主机，不支持通配符。
 服务会自动使用系统受信任 CA 并保持严格 TLS 校验；私有 CA 可通过 `WORKBENCH_SSL_CERT` 指定，且证书必须位于 `SAFE_CERT_DIR` 内。
 
 ## 发布后的知识飞轮

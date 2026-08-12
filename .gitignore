@@ -218,6 +218,9 @@ __marimo__/
 
 *_tracer.json
 **/logs/
+
+# Knowledge workbench offline deployment bundles
+/knowledge-workbench-offline-*.tar
 tests/**/report/
 records/*.jsonl
 
