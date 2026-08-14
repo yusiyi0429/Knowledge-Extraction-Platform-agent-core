@@ -167,7 +167,7 @@ function SceneMaterialsStep({
   const [name, setName] = useState(scene.name);
   const [description, setDescription] = useState(scene.description);
   const [goal, setGoal] = useState(scene.goal);
-  const [subscenes, setSubscenes] = useState<string[]>(round.subscenes.length ? round.subscenes : [""]);
+  const [subscene, setSubscene] = useState(round.subscenes[0] ?? "");
   const [busy, setBusy] = useState(false);
 
   async function save(advance = false) {
@@ -175,7 +175,7 @@ function SceneMaterialsStep({
     try {
       await api(`/scenes/${scene.id}`, {
         method: "PATCH",
-        body: jsonBody({ name, description, goal, subscenes: subscenes.filter((item) => item.trim()) }),
+        body: jsonBody({ name, description, goal, subscenes: subscene.trim() ? [subscene.trim()] : [] }),
       });
       setNotice({ tone: "success", text: advance ? "场景已保存，可开始知识萃取。" : "场景目标与子场景已保存。" });
       await onReload();
@@ -223,12 +223,9 @@ function SceneMaterialsStep({
         </div>
       </section>
       <section className="form-card">
-        <header><h3>子场景</h3><span>可选，用于拆分不同流程或规则分支</span></header>
-        <div className="subscene-list">
-          {subscenes.map((item, index) => (
-            <div key={`${index}-${round.id}`}><span>{String(index + 1).padStart(2, "0")}</span><input value={item} onChange={(event) => setSubscenes((current) => current.map((value, itemIndex) => itemIndex === index ? event.target.value : value))} disabled={published} placeholder="例如：差旅申请前置审核" />{subscenes.length > 1 && !published && <button aria-label="删除子场景" onClick={() => setSubscenes((current) => current.filter((_, itemIndex) => itemIndex !== index))}><Icon name="close" size={15} /></button>}</div>
-          ))}
-          {!published && <Button kind="text" icon="plus" onClick={() => setSubscenes((current) => [...current, ""])}>添加子场景</Button>}
+        <header><h3>本轮子场景</h3><span>每轮萃取聚焦一个具体业务分支</span></header>
+        <div className="field-grid">
+          <label className="full">子场景名称<input value={subscene} onChange={(event) => setSubscene(event.target.value)} disabled={published} placeholder="例如：差旅申请前置审核" /></label>
         </div>
       </section>
       <section className="form-card material-card">

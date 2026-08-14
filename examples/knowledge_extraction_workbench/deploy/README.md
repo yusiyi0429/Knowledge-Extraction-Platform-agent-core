@@ -36,8 +36,8 @@ examples/knowledge_extraction_workbench/deploy/export-all-offline-bundles.sh
 
 默认产物目录为 `dist/knowledge-workbench-offline/`，包含：
 
-- `knowledge-workbench-offline-0.1.0-linux-amd64.tar`：用于 `uname -m` 显示 `x86_64` 的 Intel/AMD 服务器。
-- `knowledge-workbench-offline-0.1.0-linux-arm64.tar`：用于 `uname -m` 显示 `aarch64` 或 `arm64` 的 ARM 服务器。
+- `knowledge-workbench-offline-0.1.1-linux-amd64.tar`：用于 `uname -m` 显示 `x86_64` 的 Intel/AMD 服务器。
+- `knowledge-workbench-offline-0.1.1-linux-arm64.tar`：用于 `uname -m` 显示 `aarch64` 或 `arm64` 的 ARM 服务器。
 - `SHA256SUMS`：两份外层离线包的校验值；每个包内部另有一份全文件校验清单。
 
 只构建单一架构时仍可使用底层脚本：
@@ -54,7 +54,7 @@ examples/knowledge_extraction_workbench/deploy/export-offline-bundle.sh
 先在目标服务器执行 `uname -m`，再将匹配架构的 `.tar` 文件通过批准的介质复制过去。例如 x86_64 服务器：
 
 ```bash
-tar -xf knowledge-workbench-offline-0.1.0-linux-amd64.tar
+tar -xf knowledge-workbench-offline-0.1.1-linux-amd64.tar
 cd knowledge-workbench-offline
 ./start-offline.sh
 ```

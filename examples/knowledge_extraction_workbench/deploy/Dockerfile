@@ -26,7 +26,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     uv sync --frozen --no-dev --no-editable
 
 FROM ${PYTHON_IMAGE} AS runtime
-ARG APP_VERSION=0.1.0
+ARG APP_VERSION=0.1.1
 LABEL org.opencontainers.image.title="Knowledge Extraction Workbench" \
       org.opencontainers.image.description="Offline-deployable openJiuwen knowledge extraction workbench" \
       org.opencontainers.image.version="${APP_VERSION}"
