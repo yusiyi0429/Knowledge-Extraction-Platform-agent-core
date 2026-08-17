@@ -36,8 +36,8 @@ examples/knowledge_extraction_workbench/deploy/export-all-offline-bundles.sh
 
 默认产物目录为 `dist/knowledge-workbench-offline/`，包含：
 
-- `knowledge-workbench-offline-0.1.3-linux-amd64.tar`：用于 `uname -m` 显示 `x86_64` 的 Intel/AMD 服务器。
-- `knowledge-workbench-offline-0.1.3-linux-arm64.tar`：用于 `uname -m` 显示 `aarch64` 或 `arm64` 的 ARM 服务器。
+- `knowledge-workbench-offline-0.1.4-linux-amd64.tar`：用于 `uname -m` 显示 `x86_64` 的 Intel/AMD 服务器。
+- `knowledge-workbench-offline-0.1.4-linux-arm64.tar`：用于 `uname -m` 显示 `aarch64` 或 `arm64` 的 ARM 服务器。
 - `SHA256SUMS`：两份外层离线包的校验值；每个包内部另有一份全文件校验清单。
 
 只构建单一架构时仍可使用底层脚本：
@@ -54,7 +54,7 @@ examples/knowledge_extraction_workbench/deploy/export-offline-bundle.sh
 先在目标服务器执行 `uname -m`，再将匹配架构的 `.tar` 文件通过批准的介质复制过去。例如 x86_64 服务器：
 
 ```bash
-tar -xf knowledge-workbench-offline-0.1.3-linux-amd64.tar
+tar -xf knowledge-workbench-offline-0.1.4-linux-amd64.tar
 cd knowledge-workbench-offline
 ./start-offline.sh
 ```
@@ -95,7 +95,8 @@ services:
 - 持久卷名称：`knowledge-extraction-workbench_workbench-data`。
 - 数据目录：容器内 `/var/lib/knowledge-workbench`。
 - API Key 仅通过页面录入，使用卷内 `master.key` 加密；不要单独丢失或替换该文件。
-- 升级时导入新镜像并再次执行 `docker compose up -d`，数据卷不会变化。
+- 升级时将新包解压到原目录并再次执行 `./start-offline.sh`。脚本只把现有 `.env` 中的
+  `WORKBENCH_IMAGE` 与 `WORKBENCH_PLATFORM` 更新为新包版本，端口、模型 HTTP 白名单、代理等配置保持不变，数据卷不会变化。
 
 备份整个数据目录：
 
