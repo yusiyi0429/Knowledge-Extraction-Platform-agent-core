@@ -418,7 +418,15 @@ async def test_model_connection_test_passes_strict_tls_config(tmp_path, monkeypa
             captured["request_config"] = request_config
 
         async def invoke(self, *args, **kwargs):
-            return None
+            return type(
+                "Response",
+                (),
+                {
+                    "content": (
+                        '{"items":[{"question":"何时复核？","answer":"命中异常时。","source_refs":[]}]}'
+                    )
+                },
+            )()
 
     monkeypatch.setattr("openjiuwen.core.foundation.llm.Model", StubModel)
     app = create_test_app(tmp_path)
@@ -440,8 +448,47 @@ async def test_model_connection_test_passes_strict_tls_config(tmp_path, monkeypa
         tested = await client.post(f"/api/v1/models/{model['id']}/test")
 
         assert tested.status == 200, await tested.text()
+        assert (await tested.json())["message"] == "模型连接与结构化输出可用"
         assert captured["client_config"].verify_ssl is True
         assert Path(captured["client_config"].ssl_cert).is_file()
+        assert captured["request_config"].max_tokens == 256
+    finally:
+        await client.close()
+
+
+@pytest.mark.asyncio
+async def test_model_connection_test_rejects_invalid_structured_output(tmp_path, monkeypatch):
+    class StubModel:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def invoke(self, *_args, **_kwargs):
+            return type("Response", (), {"content": '{"message":"连接成功"}'})()
+
+    monkeypatch.setattr("openjiuwen.core.foundation.llm.Model", StubModel)
+    app = create_test_app(tmp_path)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    try:
+        created = await client.post(
+            "/api/v1/models",
+            json={
+                "name": "结构不兼容模型",
+                "provider": "OpenAI",
+                "api_base": "https://model.example.com/v1",
+                "model_name": "MiniMax-M2.7",
+                "api_key": "test-key",
+            },
+        )
+        model = await created.json()
+
+        tested = await client.post(f"/api/v1/models/{model['id']}/test")
+        payload = await tested.json()
+
+        assert tested.status == 422
+        assert payload["code"] == "MODEL_STRUCTURED_OUTPUT_INVALID"
+        assert payload["retryable"] is True
+        assert payload["details"] == {"response_shape": "顶层对象字段=['message']"}
     finally:
         await client.close()
 

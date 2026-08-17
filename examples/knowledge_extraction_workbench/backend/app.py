@@ -42,7 +42,7 @@ from .models import (
     new_id,
     utc_now,
 )
-from .model_runtime import build_model_client_config, model_connection_error
+from .model_runtime import OpenJiuwenKnowledgeModel, build_model_client_config, model_connection_error
 from .pipeline import SUPPORTED_EXTENSIONS, parse_material, validate_skill_zip
 from .service import REQUIRED_ASSET_KINDS, TERMINAL_JOB_STATUSES, WorkbenchService
 from .store import ABILITY_SPECS, Store
@@ -1643,12 +1643,28 @@ async def test_model_connection(request: web.Request) -> web.Response:
             timeout=20,
             max_retries=0,
         )
-        runtime = Model(client, ModelRequestConfig(model=model.model_name, temperature=0, max_tokens=8))
-        await runtime.invoke("仅回复 OK", model=model.model_name, timeout=20)
+        runtime = Model(client, ModelRequestConfig(model=model.model_name, temperature=0, max_tokens=256))
+        response = await runtime.invoke(
+            (
+                "只返回合法 JSON，不要输出 Markdown 或解释。严格返回："
+                '{"items":[{"question":"何时需要人工复核？","answer":"命中异常条件时。","source_refs":[]}]}。'
+            ),
+            model=model.model_name,
+            timeout=20,
+        )
     except Exception as exc:
         raise model_connection_error(exc) from exc
+    parsed = OpenJiuwenKnowledgeModel._decode_json(getattr(response, "content", None))
+    if not OpenJiuwenKnowledgeModel._normalize_qa_items(parsed):
+        raise WorkbenchError(
+            "MODEL_STRUCTURED_OUTPUT_INVALID",
+            "模型连接成功，但未返回可用的 QA JSON 结构。请检查模型的结构化输出能力。",
+            status=422,
+            retryable=True,
+            details={"response_shape": OpenJiuwenKnowledgeModel._json_shape_summary(parsed)},
+        )
     latency_ms = round((asyncio.get_running_loop().time() - started) * 1000)
-    return web.json_response({"ok": True, "latency_ms": latency_ms, "message": "模型连接可用"})
+    return web.json_response({"ok": True, "latency_ms": latency_ms, "message": "模型连接与结构化输出可用"})
 
 
 async def list_skills(request: web.Request) -> web.Response:

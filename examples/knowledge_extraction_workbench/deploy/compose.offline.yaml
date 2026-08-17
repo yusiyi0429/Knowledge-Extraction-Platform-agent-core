@@ -2,7 +2,7 @@ name: knowledge-extraction-workbench
 
 services:
   workbench:
-    image: ${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.1}
+    image: ${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.2}
     pull_policy: never
     platform: ${WORKBENCH_PLATFORM:-linux/amd64}
     init: true

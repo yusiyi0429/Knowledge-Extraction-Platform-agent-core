@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
 
-IMAGE_NAME=${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.1}
+IMAGE_NAME=${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.2}
 PLATFORM=${WORKBENCH_PLATFORM:-linux/amd64}
 PLATFORM_LABEL=$(printf '%s' "$PLATFORM" | tr '/' '-')
 OUTPUT=${1:-"$REPO_ROOT/knowledge-workbench-offline-${PLATFORM_LABEL}.tar"}

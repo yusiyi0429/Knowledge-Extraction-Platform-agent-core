@@ -2,12 +2,12 @@ name: knowledge-extraction-workbench
 
 services:
   workbench:
-    image: ${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.1}
+    image: ${WORKBENCH_IMAGE:-knowledge-extraction-workbench:0.1.2}
     build:
       context: ../../..
       dockerfile: examples/knowledge_extraction_workbench/deploy/Dockerfile
       args:
-        APP_VERSION: ${WORKBENCH_VERSION:-0.1.1}
+        APP_VERSION: ${WORKBENCH_VERSION:-0.1.2}
     platform: ${WORKBENCH_PLATFORM:-linux/amd64}
     init: true
     restart: unless-stopped

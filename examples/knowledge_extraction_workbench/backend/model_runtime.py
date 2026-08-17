@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from typing import Any
 
 import openai
@@ -192,7 +193,109 @@ class OpenJiuwenKnowledgeModel:
                 return parsed
         return None
 
-    async def _invoke_json(self, instruction: str, context: str) -> Any:
+    @staticmethod
+    def _json_shape_summary(payload: Any) -> str:
+        """Describe an invalid response shape without exposing model content."""
+
+        if isinstance(payload, dict):
+            keys = sorted(str(key) for key in payload)[:20]
+            return f"顶层对象字段={keys}"
+        if isinstance(payload, list):
+            first_keys = sorted(str(key) for key in payload[0])[:20] if payload and isinstance(payload[0], dict) else []
+            return f"顶层数组长度={len(payload)}，首项字段={first_keys}"
+        return f"顶层类型={type(payload).__name__}"
+
+    @classmethod
+    def _extract_item_list(cls, payload: Any, aliases: tuple[str, ...]) -> list[Any] | None:
+        """Accept common OpenAI-compatible wrappers while keeping item validation strict."""
+
+        if isinstance(payload, list):
+            return payload
+        if not isinstance(payload, dict):
+            return None
+        for key in ("items", *aliases):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+        for key in ("data", "result", "output", "response"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                nested = cls._extract_item_list(value, aliases)
+                if nested is not None:
+                    return nested
+        return None
+
+    @staticmethod
+    def _first_text(item: dict[str, Any], keys: tuple[str, ...]) -> str:
+        for key in keys:
+            value = item.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    @staticmethod
+    def _source_refs(item: dict[str, Any]) -> list[Any]:
+        for key in ("source_refs", "sources", "references", "citations", "来源"):
+            value = item.get(key)
+            if isinstance(value, list):
+                return value
+            if isinstance(value, dict):
+                return [value]
+        return []
+
+    @classmethod
+    def _normalize_qa_items(cls, payload: Any) -> list[dict[str, Any]]:
+        items = cls._extract_item_list(payload, ("qa_pairs", "qas", "questions")) or []
+        normalized = []
+        for item in items[:20]:
+            if not isinstance(item, dict):
+                continue
+            question = cls._first_text(item, ("question", "query", "input", "prompt", "问题"))
+            answer = cls._first_text(item, ("answer", "response", "output", "expected", "答案"))
+            if question and answer:
+                normalized.append(
+                    {
+                        "question": question,
+                        "answer": answer,
+                        "source_refs": cls._source_refs(item),
+                    }
+                )
+        return normalized
+
+    @classmethod
+    def _normalize_evaluation_items(cls, payload: Any) -> list[dict[str, Any]]:
+        items = cls._extract_item_list(payload, ("evaluations", "cases", "samples", "test_cases")) or []
+        normalized = []
+        for item in items[:20]:
+            if not isinstance(item, dict):
+                continue
+            input_text = cls._first_text(item, ("input", "question", "query", "scenario", "case", "输入", "场景"))
+            expected = cls._first_text(
+                item,
+                ("expected", "answer", "output", "reference_answer", "expected_output", "标准答案", "预期结果"),
+            )
+            if input_text and expected:
+                normalized.append(
+                    {
+                        "input": input_text,
+                        "expected": expected,
+                        "source_refs": cls._source_refs(item),
+                        "synthetic": True,
+                        "evaluation_status": "待评测",
+                    }
+                )
+        return normalized
+
+    async def _invoke_json(
+        self,
+        instruction: str,
+        context: str,
+        *,
+        validator: Callable[[Any], bool] | None = None,
+        failure_message: str = "模型连续两次未返回符合约定的 JSON 结构。",
+    ) -> Any:
         messages = [
             SystemMessage(
                 content=(
@@ -224,12 +327,16 @@ class OpenJiuwenKnowledgeModel:
             except Exception as exc:
                 raise model_connection_error(exc) from exc
             parsed = self._decode_json(response.content)
-            if parsed is not None:
+            if parsed is not None and (validator is None or validator(parsed)):
                 return parsed
-            invalid_content = response.content if isinstance(response.content, str) else str(response.content)
+            invalid_content = (
+                self._json_shape_summary(parsed)
+                if parsed is not None
+                else (response.content if isinstance(response.content, str) else str(response.content))
+            )
         raise WorkbenchError(
             "MODEL_JSON_INVALID",
-            "模型连续两次未返回符合约定的 JSON 结构。",
+            failure_message,
             status=422,
             retryable=True,
         )
@@ -461,19 +568,10 @@ class OpenJiuwenKnowledgeModel:
                 '{"items":[{"question":"...","answer":"...","source_refs":[...]}]}。'
             ),
             json.dumps(structured, ensure_ascii=False),
+            validator=lambda candidate: bool(self._normalize_qa_items(candidate)),
+            failure_message="模型连续两次未返回可用 QA 结构。",
         )
-        items = payload.get("items") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
-            raise WorkbenchError("MODEL_JSON_INVALID", "模型 QA 结构无效。", status=422, retryable=True)
-        return [
-            {
-                "question": str(item.get("question", "")),
-                "answer": str(item.get("answer", "")),
-                "source_refs": item.get("source_refs", []),
-            }
-            for item in items[:20]
-            if isinstance(item, dict) and item.get("question") and item.get("answer")
-        ]
+        return self._normalize_qa_items(payload)
 
     async def generate_evaluation(
         self,
@@ -493,24 +591,10 @@ class OpenJiuwenKnowledgeModel:
                 },
                 ensure_ascii=False,
             ),
+            validator=lambda candidate: bool(self._normalize_evaluation_items(candidate)),
+            failure_message="模型连续两次未返回可用评测集结构。",
         )
-        items = payload.get("items") if isinstance(payload, dict) else None
-        if not isinstance(items, list):
-            raise WorkbenchError("MODEL_JSON_INVALID", "模型评测集结构无效。", status=422, retryable=True)
-        normalized = [
-            {
-                "input": str(item.get("input", "")),
-                "expected": str(item.get("expected", "")),
-                "source_refs": item.get("source_refs", []),
-                "synthetic": True,
-                "evaluation_status": "待评测",
-            }
-            for item in items[:20]
-            if isinstance(item, dict) and item.get("input") and item.get("expected")
-        ]
-        if not normalized:
-            raise WorkbenchError("EVALUATION_RESULT_EMPTY", "模型未返回可用评测样本。", status=422, retryable=True)
-        return normalized
+        return self._normalize_evaluation_items(payload)
 
     @staticmethod
     def _business_context(structured: dict[str, Any]) -> dict[str, Any]:
