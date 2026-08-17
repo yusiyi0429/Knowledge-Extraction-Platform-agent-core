@@ -4,7 +4,7 @@ set -eu
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/../../.." && pwd)
 
-VERSION=${WORKBENCH_VERSION:-0.1.2}
+VERSION=${WORKBENCH_VERSION:-0.1.3}
 IMAGE_REPOSITORY=${WORKBENCH_IMAGE_REPOSITORY:-knowledge-extraction-workbench}
 OUTPUT_DIR=${1:-"$REPO_ROOT/dist/knowledge-workbench-offline"}
 

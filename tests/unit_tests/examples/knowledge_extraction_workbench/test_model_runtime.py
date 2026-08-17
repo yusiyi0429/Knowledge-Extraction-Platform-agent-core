@@ -26,6 +26,23 @@ def test_decode_json_accepts_text_content_blocks():
     assert parsed == {"old_text": "原文", "new_text": "新文"}
 
 
+def test_decode_json_ignores_minimax_thinking_json_before_final_answer():
+    parsed = OpenJiuwenKnowledgeModel._decode_json(
+        '<think>先检查 {"message":"这不是最终答案"}</think>\n'
+        '{"items":[{"question":"何时复核？","answer":"命中异常时。","source_refs":[]}]}'
+    )
+
+    assert parsed == {
+        "items": [
+            {
+                "question": "何时复核？",
+                "answer": "命中异常时。",
+                "source_refs": [],
+            }
+        ]
+    }
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -113,4 +130,59 @@ async def test_generate_qa_reports_invalid_schema_after_repair_retry():
     assert caught.value.code == "MODEL_JSON_INVALID"
     assert caught.value.message == "模型连续两次未返回可用 QA 结构。"
     assert caught.value.retryable is True
+    assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_qa_falls_back_to_reviewed_rules_after_invalid_model_output():
+    runtime, model = _runtime_with_responses(['{"message":"第一次"}', '{"status":"第二次"}'])
+    structured = {
+        "rules": [
+            {
+                "title": "异常复核",
+                "condition": "命中风险标记",
+                "action": "转人工复核",
+                "exceptions": "白名单客户除外",
+                "sources": [{"material_id": "m-1", "chunk_index": 2}],
+            }
+        ]
+    }
+
+    result = await runtime.generate_qa(structured)
+
+    assert result == [
+        {
+            "question": "规则“异常复核”的适用条件和处理要求是什么？",
+            "answer": "适用条件：命中风险标记；处理要求：转人工复核；例外说明：白名单客户除外。",
+            "source_refs": [{"material_id": "m-1", "chunk_index": 2}],
+        }
+    ]
+    assert len(model.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_generate_evaluation_falls_back_to_reviewed_rules_after_invalid_model_output():
+    runtime, model = _runtime_with_responses(['{"message":"第一次"}', '{"status":"第二次"}'])
+    structured = {
+        "rules": [
+            {
+                "title": "异常复核",
+                "condition": "命中风险标记",
+                "action": "转人工复核",
+                "sources": [{"material_id": "m-1", "chunk_index": 2}],
+            }
+        ]
+    }
+
+    result = await runtime.generate_evaluation(structured, [])
+
+    assert result == [
+        {
+            "input": "业务场景符合“命中风险标记”，应如何处理？",
+            "expected": "应执行：转人工复核。",
+            "source_refs": [{"material_id": "m-1", "chunk_index": 2}],
+            "synthetic": True,
+            "evaluation_status": "待评测",
+        }
+    ]
     assert len(model.calls) == 2

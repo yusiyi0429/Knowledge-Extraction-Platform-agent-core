@@ -166,22 +166,21 @@ class OpenJiuwenKnowledgeModel:
                 return content
         if not isinstance(content, str):
             return None
-        text = content.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if lines and lines[0].strip().lower() in {"```", "```json"}:
-                lines = lines[1:]
-            if lines and lines[-1].strip() == "```":
-                lines = lines[:-1]
-            text = "\n".join(lines).strip()
-        candidates = [text]
-        object_start, object_end = text.find("{"), text.rfind("}")
-        array_start, array_end = text.find("["), text.rfind("]")
-        if object_start >= 0 and object_end > object_start:
-            candidates.append(text[object_start : object_end + 1])
-        if array_start >= 0 and array_end > array_start:
-            candidates.append(text[array_start : array_end + 1])
+        original = content.strip().lstrip("\ufeff")
+        text = OpenJiuwenKnowledgeModel._strip_reasoning_sections(original)
+        candidates = [
+            match.group(1).strip()
+            for match in re.finditer(r"```(?:json)?\s*(.*?)```", text, flags=re.IGNORECASE | re.DOTALL)
+        ]
+        candidates.extend(reversed(OpenJiuwenKnowledgeModel._balanced_json_spans(text)))
+        candidates.append(text)
+        if text != original:
+            candidates.append(original)
+        seen: set[str] = set()
         for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
             try:
                 parsed = json.loads(candidate)
             except json.JSONDecodeError:
@@ -192,6 +191,56 @@ class OpenJiuwenKnowledgeModel:
             if isinstance(parsed, (dict, list)):
                 return parsed
         return None
+
+    @staticmethod
+    def _strip_reasoning_sections(text: str) -> str:
+        """Remove reasoning blocks emitted inline by MiniMax and similar models."""
+
+        return re.sub(
+            r"<(think|analysis|reasoning)\b[^>]*>.*?</\1\s*>",
+            "",
+            text,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+
+    @staticmethod
+    def _balanced_json_spans(text: str) -> list[str]:
+        """Return complete top-level JSON objects/arrays embedded in prose."""
+
+        spans: list[str] = []
+        start: int | None = None
+        stack: list[str] = []
+        in_string = False
+        escaped = False
+        pairs = {"}": "{", "]": "["}
+        for index, char in enumerate(text):
+            if start is None:
+                if char in "[{":
+                    start = index
+                    stack = [char]
+                continue
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char in "[{":
+                stack.append(char)
+            elif char in "]}":
+                if not stack or stack[-1] != pairs[char]:
+                    start = None
+                    stack = []
+                    continue
+                stack.pop()
+                if not stack and start is not None:
+                    spans.append(text[start : index + 1])
+                    start = None
+        return spans
 
     @staticmethod
     def _json_shape_summary(payload: Any) -> str:
@@ -561,16 +610,131 @@ class OpenJiuwenKnowledgeModel:
             "source_refs": payload.get("source_refs", []) if isinstance(payload.get("source_refs"), list) else [],
         }
 
+    @staticmethod
+    def _fallback_sources(item: dict[str, Any]) -> list[Any]:
+        for key in ("sources", "source_refs"):
+            value = item.get(key)
+            if isinstance(value, list):
+                return value
+        return []
+
+    @classmethod
+    def _fallback_qa_items(cls, structured: dict[str, Any]) -> list[dict[str, Any]]:
+        """Build source-traceable QA assets when a provider cannot obey the JSON contract."""
+
+        items: list[dict[str, Any]] = []
+        rules = structured.get("rules", [])
+        if isinstance(rules, list):
+            for index, rule in enumerate(rules[:20], start=1):
+                if not isinstance(rule, dict):
+                    continue
+                title = str(rule.get("title") or rule.get("name") or f"规则 {index}").strip()
+                condition = str(rule.get("condition") or "").strip()
+                action = str(rule.get("action") or rule.get("requirement") or "").strip()
+                exceptions = str(rule.get("exceptions") or "").strip()
+                answer_parts = []
+                if condition:
+                    answer_parts.append(f"适用条件：{condition}")
+                if action:
+                    answer_parts.append(f"处理要求：{action}")
+                if exceptions:
+                    answer_parts.append(f"例外说明：{exceptions}")
+                if not answer_parts:
+                    continue
+                items.append(
+                    {
+                        "question": f"规则“{title}”的适用条件和处理要求是什么？",
+                        "answer": "；".join(answer_parts) + "。",
+                        "source_refs": cls._fallback_sources(rule),
+                    }
+                )
+        if items:
+            return items
+        process = structured.get("process", [])
+        if isinstance(process, list):
+            for index, node in enumerate(process[:20], start=1):
+                if not isinstance(node, dict):
+                    continue
+                name = str(node.get("name") or f"步骤 {index}").strip()
+                description = str(node.get("description") or "").strip()
+                if description:
+                    items.append(
+                        {
+                            "question": f"流程步骤“{name}”应如何执行？",
+                            "answer": description,
+                            "source_refs": cls._fallback_sources(node),
+                        }
+                    )
+        return items
+
+    @classmethod
+    def _fallback_evaluation_items(
+        cls,
+        structured: dict[str, Any],
+        qa_items: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Build a small synthetic evaluation set from reviewed rules or QA."""
+
+        items: list[dict[str, Any]] = []
+        rules = structured.get("rules", [])
+        if isinstance(rules, list):
+            for index, rule in enumerate(rules[:8], start=1):
+                if not isinstance(rule, dict):
+                    continue
+                title = str(rule.get("title") or rule.get("name") or f"规则 {index}").strip()
+                condition = str(rule.get("condition") or title).strip()
+                action = str(rule.get("action") or rule.get("requirement") or "").strip()
+                exceptions = str(rule.get("exceptions") or "").strip()
+                if not action:
+                    continue
+                expected = f"应执行：{action}"
+                if exceptions:
+                    expected += f"；同时核对例外：{exceptions}"
+                items.append(
+                    {
+                        "input": f"业务场景符合“{condition}”，应如何处理？",
+                        "expected": expected + "。",
+                        "source_refs": cls._fallback_sources(rule),
+                        "synthetic": True,
+                        "evaluation_status": "待评测",
+                    }
+                )
+        if items:
+            return items
+        for item in qa_items[:8]:
+            question = str(item.get("question") or "").strip()
+            answer = str(item.get("answer") or "").strip()
+            if question and answer:
+                source_refs = item.get("source_refs", [])
+                items.append(
+                    {
+                        "input": question,
+                        "expected": answer,
+                        "source_refs": source_refs if isinstance(source_refs, list) else [],
+                        "synthetic": True,
+                        "evaluation_status": "待评测",
+                    }
+                )
+        return items
+
     async def generate_qa(self, structured: dict[str, Any]) -> list[dict[str, Any]]:
-        payload = await self._invoke_json(
-            (
-                "基于规则生成不超过 20 条问答，答案必须可由规则支持并保留来源。返回对象："
-                '{"items":[{"question":"...","answer":"...","source_refs":[...]}]}。'
-            ),
-            json.dumps(structured, ensure_ascii=False),
-            validator=lambda candidate: bool(self._normalize_qa_items(candidate)),
-            failure_message="模型连续两次未返回可用 QA 结构。",
-        )
+        try:
+            payload = await self._invoke_json(
+                (
+                    "基于规则生成不超过 20 条问答，答案必须可由规则支持并保留来源。返回对象："
+                    '{"items":[{"question":"...","answer":"...","source_refs":[...]}]}。'
+                ),
+                json.dumps(structured, ensure_ascii=False),
+                validator=lambda candidate: bool(self._normalize_qa_items(candidate)),
+                failure_message="模型连续两次未返回可用 QA 结构。",
+            )
+        except WorkbenchError as error:
+            if error.code != "MODEL_JSON_INVALID":
+                raise
+            fallback = self._fallback_qa_items(structured)
+            if fallback:
+                return fallback
+            raise
         return self._normalize_qa_items(payload)
 
     async def generate_evaluation(
@@ -578,22 +742,30 @@ class OpenJiuwenKnowledgeModel:
         structured: dict[str, Any],
         qa_items: list[dict[str, Any]],
     ) -> list[dict[str, Any]]:
-        payload = await self._invoke_json(
-            (
-                "直接基于规则和 QA 构造最多 8 条简洁的边界或异常场景评测样本，不要解释过程，"
-                "不要简单复述问题，每个 input 和 expected 不超过 200 字。返回对象："
-                '{"items":[{"input":"...","expected":"...","source_refs":[...]}]}。'
-            ),
-            json.dumps(
-                {
-                    "rules": structured.get("rules", [])[:8],
-                    "qa_items": qa_items[:8],
-                },
-                ensure_ascii=False,
-            ),
-            validator=lambda candidate: bool(self._normalize_evaluation_items(candidate)),
-            failure_message="模型连续两次未返回可用评测集结构。",
-        )
+        try:
+            payload = await self._invoke_json(
+                (
+                    "直接基于规则和 QA 构造最多 8 条简洁的边界或异常场景评测样本，不要解释过程，"
+                    "不要简单复述问题，每个 input 和 expected 不超过 200 字。返回对象："
+                    '{"items":[{"input":"...","expected":"...","source_refs":[...]}]}。'
+                ),
+                json.dumps(
+                    {
+                        "rules": structured.get("rules", [])[:8],
+                        "qa_items": qa_items[:8],
+                    },
+                    ensure_ascii=False,
+                ),
+                validator=lambda candidate: bool(self._normalize_evaluation_items(candidate)),
+                failure_message="模型连续两次未返回可用评测集结构。",
+            )
+        except WorkbenchError as error:
+            if error.code != "MODEL_JSON_INVALID":
+                raise
+            fallback = self._fallback_evaluation_items(structured, qa_items)
+            if fallback:
+                return fallback
+            raise
         return self._normalize_evaluation_items(payload)
 
     @staticmethod

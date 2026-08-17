@@ -77,7 +77,7 @@ examples/knowledge_extraction_workbench/deploy/export-all-offline-bundles.sh
 根据服务器 `uname -m` 选择 `dist/knowledge-workbench-offline/` 中的 `linux-amd64` 或 `linux-arm64` 包。以 x86_64 服务器为例：
 
 ```bash
-tar -xf knowledge-workbench-offline-0.1.2-linux-amd64.tar
+tar -xf knowledge-workbench-offline-0.1.3-linux-amd64.tar
 cd knowledge-workbench-offline
 ./start-offline.sh
 ```
